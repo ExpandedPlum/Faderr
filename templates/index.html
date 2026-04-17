@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Faderr</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-left">
+      <button id="btn-sidebar-toggle" class="btn btn-ghost btn-icon" title="Toggle sidebar">☰</button>
+      <h1>Faderr</h1>
+    </div>
+    <div class="header-center" id="gen-progress-wrap" style="display:none">
+      <div class="gen-progress-bar-track">
+        <div id="gen-progress-bar" class="gen-progress-bar-fill" style="width:0%"></div>
+      </div>
+      <span id="gen-progress-label" class="gen-progress-label">Starting…</span>
+    </div>
+    <div class="header-right">
+      <button id="btn-generate" class="btn">Generate Playlist</button>
+      <button id="btn-history" class="btn">History</button>
+    </div>
+  </header>
+
+  <!-- Modal -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 id="modal-title"></h3>
+      <p id="modal-message"></p>
+      <div id="modal-buttons" class="modal-buttons"></div>
+    </div>
+  </div>
+
+  <!-- Mobile drawer backdrop -->
+  <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+  <div class="layout">
+
+    <!-- ── Sidebar ──────────────────────────────────────────────── -->
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-top">
+        <input id="sidebar-search" class="sidebar-search" placeholder="Search artists… (/)" autocomplete="off" />
+        <div class="sidebar-filters">
+          <button class="sf-btn active" data-status="">All</button>
+          <button class="sf-btn" data-status="undecided">Undecided</button>
+          <button class="sf-btn" data-status="keep">Keep</button>
+          <button class="sf-btn" data-status="explore">Exploring</button>
+          <button class="sf-btn" data-status="delete">Deleted</button>
+        </div>
+      </div>
+      <ul id="sidebar-list" class="sidebar-list"></ul>
+    </aside>
+
+    <!-- ── Main content ──────────────────────────────────────────── -->
+    <main>
+
+      <!-- Current / focused artist -->
+      <section id="section-current" class="hidden">
+        <div class="triage-layout">
+
+          <!-- Left: now-playing workspace -->
+          <div class="triage-player">
+
+            <div class="now-playing">
+              <img id="artist-thumb" src="" alt="" class="artist-thumb" />
+              <div class="now-playing-meta">
+                <div class="artist-nav">
+                  <button id="btn-prev" class="btn btn-ghost btn-icon" title="Previous artist (←)">←</button>
+                  <h2 id="artist-name">—</h2>
+                  <button id="btn-next" class="btn btn-ghost btn-icon" title="Next artist (→)">→</button>
+                </div>
+                <p id="track-title" class="track-title">—</p>
+                <span id="source-badge" class="badge"></span>
+                <div class="audio-player">
+                  <audio id="audio" preload="auto"></audio>
+                  <div class="audio-controls">
+                    <button id="btn-playpause" class="btn btn-icon" title="Play/Pause (Space)">▶</button>
+                    <div class="audio-progress-wrap">
+                      <span id="audio-current">0:00</span>
+                      <input id="audio-seek" type="range" min="0" max="100" value="0" step="0.1" class="audio-seek" />
+                      <span id="audio-duration">0:00</span>
+                    </div>
+                    <button id="btn-skip" class="btn btn-ghost btn-sm" title="Try a different track">Skip</button>
+                    <span id="audio-status" class="audio-status"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="action-buttons">
+              <button id="btn-keep"    class="btn btn-keep"    title="Keep this artist (K)">Keep</button>
+              <button id="btn-explore" class="btn btn-explore" title="Listen to more (E)">Listen to More</button>
+              <button id="btn-delete"  class="btn btn-delete"  title="Delete artist (D)">Delete</button>
+            </div>
+
+            <div id="delete-confirm" class="delete-confirm hidden">
+              <p>Delete <strong id="delete-artist-name"></strong> from your library and disk?</p>
+              <div class="confirm-buttons">
+                <button id="btn-delete-confirm" class="btn btn-delete">Yes, Delete</button>
+                <button id="btn-delete-cancel"  class="btn btn-ghost">Cancel</button>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Right: bio as context -->
+          <div class="triage-context">
+            <div id="artist-bio-wrap" class="artist-bio-wrap hidden">
+              <p class="bio-label">About</p>
+              <p id="artist-bio" class="artist-bio"></p>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- All done -->
+      <section id="section-done" class="card done-card hidden">
+        <h2>All artists triaged!</h2>
+        <p>Check the exploring queue below or generate a new playlist to continue.</p>
+      </section>
+
+      <!-- Empty state -->
+      <section id="section-empty" class="card empty-card">
+        <h2>No playlist yet</h2>
+        <p>Click <strong>Generate Playlist</strong> to get started.</p>
+        <p class="kbd-hint">Keyboard shortcuts: <kbd>K</kbd> Keep · <kbd>E</kbd> Explore · <kbd>D</kbd> Delete · <kbd>←</kbd><kbd>→</kbd> Navigate · <kbd>Space</kbd> Play/Pause · <kbd>/</kbd> Search</p>
+      </section>
+
+      <!-- Progress bar -->
+      <section id="section-stats" class="stats-card hidden">
+        <div class="progress-header">
+          <span id="stats-label">0 / 0 artists triaged</span>
+          <span id="stats-breakdown" class="stats-breakdown"></span>
+        </div>
+        <div class="progress-bar-track">
+          <div id="progress-bar" class="progress-bar-fill" style="width: 0%"></div>
+        </div>
+      </section>
+
+      <!-- History Panel -->
+      <section id="section-history" class="card hidden">
+        <div class="history-header">
+          <h3>History</h3>
+          <button id="btn-history-close" class="btn btn-ghost btn-sm">Close</button>
+        </div>
+        <div class="history-filters">
+          <button class="filter-btn active" data-filter="">All</button>
+          <button class="filter-btn" data-filter="keep">Keep</button>
+          <button class="filter-btn" data-filter="explore_keep">Kept (via Explore)</button>
+          <button class="filter-btn" data-filter="explore">Exploring</button>
+          <button class="filter-btn" data-filter="delete">Deleted</button>
+        </div>
+        <ul id="history-list" class="history-list"></ul>
+      </section>
+
+    </main>
+  </div><!-- /.layout -->
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
