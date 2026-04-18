@@ -10,6 +10,11 @@ def _get_server() -> PlexServer:
     return PlexServer(config.PLEX_URL, config.PLEX_TOKEN)
 
 
+def get_server() -> PlexServer:
+    """Return a new PlexServer instance for callers that need to reuse one connection."""
+    return _get_server()
+
+
 def _get_music_section(server: PlexServer):
     return server.library.section(config.PLEX_MUSIC_LIBRARY)
 
@@ -85,6 +90,38 @@ def find_track_by_title(artist_rating_key: str, title: str) -> Optional[dict]:
     return None
 
 
+def resolve_track_for_artist(
+    server: PlexServer,
+    artist_rating_key: str,
+    lastfm_title: Optional[str],
+) -> tuple[Optional[dict], str]:
+    """Resolve the best track for an artist using an existing PlexServer connection.
+    Returns (track_dict, source) where source is 'lastfm' or 'plex_random'.
+    Makes only ONE fetchItem + ONE tracks() call per artist, regardless of source.
+    """
+    artist = server.fetchItem(int(artist_rating_key))
+    tracks = artist.tracks()
+    if not tracks:
+        return None, "plex_random"
+
+    if lastfm_title:
+        title_lower = lastfm_title.lower()
+        for track in tracks:
+            if track.title.lower() == title_lower:
+                return {
+                    "title": track.title,
+                    "rating_key": str(track.ratingKey),
+                    "stream_key": _track_part_key(track),
+                }, "lastfm"
+
+    track = random.choice(tracks)
+    return {
+        "title": track.title,
+        "rating_key": str(track.ratingKey),
+        "stream_key": _track_part_key(track),
+    }, "plex_random"
+
+
 def get_additional_tracks(artist_rating_key: str, exclude_key: str, count: int = 5) -> list[dict]:
     """Get up to `count` additional tracks from an artist, excluding a specific track."""
     server = _get_server()
@@ -103,9 +140,11 @@ def get_all_tracks(artist_rating_key: str, exclude_key: Optional[str] = None) ->
     return [{"title": t.title, "rating_key": str(t.ratingKey), "stream_key": _track_part_key(t)} for t in tracks]
 
 
-def create_or_replace_playlist(name: str, track_keys: list[str]):
-    """Create the triage playlist, replacing it if it already exists."""
-    server = _get_server()
+def create_or_replace_playlist(name: str, track_keys: list[str], server: Optional[PlexServer] = None):
+    """Create the triage playlist, replacing it if it already exists.
+    Pass an existing `server` to reuse the connection (avoids an extra PlexServer() init)."""
+    if server is None:
+        server = _get_server()
     # Remove existing playlist with this name
     for pl in server.playlists():
         if pl.title == name:

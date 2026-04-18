@@ -69,25 +69,31 @@ async def generate_triage_playlist(
         name, result = item
         lastfm_results[name] = result
 
-    # 4. Resolve tracks for each artist
+    # 4. Resolve tracks for each artist using a single shared Plex connection.
+    # Creating PlexServer() makes an HTTP round-trip each time; reusing one
+    # connection here cuts potentially 1200+ connections down to 1.
+    plex_server = plex_service.get_server()
+
+    # Fetch names of artists that already have a decision so we don't create
+    # duplicate undecided rows for them on regeneration.
+    async with async_session() as session:
+        result = await session.execute(
+            select(TriageArtist.artist_name).where(TriageArtist.decision.is_not(None))
+        )
+        decided_names = {row[0] for row in result.fetchall()}
+    logger.info("Skipping %d already-decided artists during regeneration", len(decided_names))
+
     rows = []
     for idx, artist in enumerate(plex_artists):
         await on_progress({"stage": "resolving", "done": idx + 1, "total": total})
         name = artist["name"]
+        if name in decided_names:
+            continue  # already decided — preserve existing row, don't create a duplicate
         plex_key = artist["rating_key"]
         lidarr_id = lidarr_service.find_lidarr_id(name, lidarr_index)
 
         lastfm_track = lastfm_results.get(name)
-        track = None
-        source = "plex_random"
-
-        if lastfm_track:
-            track = plex_service.find_track_by_title(plex_key, lastfm_track)
-            if track:
-                source = "lastfm"
-
-        if not track:
-            track = plex_service.get_random_track(plex_key)
+        track, source = plex_service.resolve_track_for_artist(plex_server, plex_key, lastfm_track)
 
         if not track:
             logger.warning("No tracks found for artist %r, skipping", name)
@@ -117,9 +123,9 @@ async def generate_triage_playlist(
 
     logger.info("Inserted %d artists into triage DB", len(rows))
 
-    # 6. Build the Plex playlist
+    # 6. Build the Plex playlist (reuse the same server connection)
     track_keys = [r.track_key for r in rows]
-    plex_service.create_or_replace_playlist(config.TRIAGE_PLAYLIST_NAME, track_keys)
+    plex_service.create_or_replace_playlist(config.TRIAGE_PLAYLIST_NAME, track_keys, server=plex_server)
     logger.info("Created Plex playlist %r with %d tracks", config.TRIAGE_PLAYLIST_NAME, len(track_keys))
 
     result = {"total_artists": len(rows), "playlist_name": config.TRIAGE_PLAYLIST_NAME}
@@ -351,17 +357,47 @@ async def undo_decision(artist_id: int) -> dict:
 
 
 async def _delete_artist(artist: TriageArtist):
-    """Internal: delete from Lidarr (with files) or fall back to Plex delete.
+    """Internal: delete from Lidarr (with files), unmonitor if deletion fails,
+    then fall back to Plex delete for file removal.
     Lidarr's deleteFiles=true removes the audio files; any empty folders that
     remain on the media server can be cleaned up via Lidarr's built-in
     'Clean Empty Folders' task."""
-    if artist.lidarr_id:
+    lidarr_id = artist.lidarr_id
+
+    # Live fallback: if we don't have a cached lidarr_id, look it up now.
+    # The cached id from playlist generation can be stale or missing if the
+    # artist was added to Lidarr after the last generation, or if name
+    # normalization didn't match at that time.
+    if not lidarr_id:
         try:
-            lidarr_service.delete_artist(artist.lidarr_id, delete_files=True)
+            lidarr_artists = lidarr_service.get_all_artists()
+            lidarr_index = lidarr_service.build_lidarr_index(lidarr_artists)
+            lidarr_id = lidarr_service.find_lidarr_id(artist.artist_name, lidarr_index)
+            if lidarr_id:
+                logger.info(
+                    "Live Lidarr lookup found id=%s for %r (cached lidarr_id was NULL)",
+                    lidarr_id, artist.artist_name,
+                )
+            else:
+                logger.info(
+                    "Live Lidarr lookup found no match for %r — falling back to Plex",
+                    artist.artist_name,
+                )
+        except Exception as exc:
+            logger.warning("Live Lidarr lookup failed for %r: %s", artist.artist_name, exc)
+
+    if lidarr_id:
+        try:
+            lidarr_service.delete_artist(lidarr_id, delete_files=True)
             logger.info("Deleted artist %r via Lidarr", artist.artist_name)
             return
         except Exception as exc:
-            logger.error("Lidarr delete failed for %r: %s — falling back to Plex", artist.artist_name, exc)
+            logger.error("Lidarr delete failed for %r: %s — attempting unmonitor", artist.artist_name, exc)
+            try:
+                lidarr_service.unmonitor_artist(lidarr_id)
+                logger.info("Unmonitored artist %r in Lidarr", artist.artist_name)
+            except Exception as unmon_exc:
+                logger.error("Lidarr unmonitor also failed for %r: %s", artist.artist_name, unmon_exc)
 
     # Fallback: delete via Plex API (runs on the Plex server, so files are deleted remotely)
     try:

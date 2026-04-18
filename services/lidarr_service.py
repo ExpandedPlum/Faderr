@@ -43,3 +43,16 @@ def delete_artist(lidarr_id: int, delete_files: bool = True):
         )
         resp.raise_for_status()
         logger.info("Deleted Lidarr artist id=%s (deleteFiles=%s)", lidarr_id, delete_files)
+
+
+def unmonitor_artist(lidarr_id: int):
+    """Mark an artist as unmonitored in Lidarr so it won't be re-downloaded.
+    Used as a fallback when full deletion fails."""
+    with httpx.Client(headers=_HEADERS, timeout=15) as client:
+        resp = client.get(_url(f"/api/v1/artist/{lidarr_id}"))
+        resp.raise_for_status()
+        artist_data = resp.json()
+        artist_data["monitored"] = False
+        resp = client.put(_url(f"/api/v1/artist/{lidarr_id}"), json=artist_data)
+        resp.raise_for_status()
+        logger.info("Unmonitored Lidarr artist id=%s", lidarr_id)

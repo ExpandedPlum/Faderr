@@ -78,7 +78,7 @@ function fmtTime(secs) {
   return `${m}:${s}`;
 }
 
-function loadAudio(artistId) {
+function loadAudio(artistId, autoplay = true) {
   // Reset queue — we're starting fresh on this artist's triage track
   trackQueue = [];
   queueIndex = -1;
@@ -90,7 +90,7 @@ function loadAudio(artistId) {
   audioSeek.style.setProperty("--pct", "0%");
   audioCurrent.textContent = "0:00";
   audioDuration.textContent = "0:00";
-  audio.play().catch(() => {});
+  if (autoplay) audio.play().catch(() => {});
 }
 
 function loadQueueTrack(index) {
@@ -235,7 +235,7 @@ async function loadBio(artistId, artistName) {
 
 // ── Focus an artist ────────────────────────────────────────────────────────
 
-async function focusArtist(id) {
+async function focusArtist(id, autoplay = true) {
   // Close mobile drawer when an artist is selected
   if (window.innerWidth <= 768) closeMobileDrawer();
 
@@ -264,7 +264,7 @@ async function focusArtist(id) {
   else { artistThumb.src = ""; artistThumb.style.display = "none"; }
 
   if (artistChanged && data.stream_key) {
-    loadAudio(data.id);
+    loadAudio(data.id, autoplay);
   } else if (!data.stream_key) {
     resetAudio();
     audioStatus.textContent = "No stream available";
@@ -290,11 +290,11 @@ $("btn-next").addEventListener("click", () => navigateDir(1));
 
 // ── Load initial view (first undecided) ────────────────────────────────────
 
-async function loadInitial() {
+async function loadInitial(autoplay = true) {
   const data = await api("/api/artists/current").catch(() => null);
   if (!data) { sectionEmpty.classList.remove("hidden"); return; }
   if (data.done) { sectionCurrent.classList.add("hidden"); sectionDone.classList.remove("hidden"); return; }
-  await focusArtist(data.id);
+  await focusArtist(data.id, autoplay);
 }
 
 // ── Stats ──────────────────────────────────────────────────────────────────
@@ -549,7 +549,7 @@ async function startGenerationStream() {
           showModal("Playlist Ready", `"${evt.playlist_name}" created with ${evt.total_artists} artists.`, [
             { label: "OK", primary: true, action: () => {} },
           ]);
-          await loadInitial();
+          await loadInitial(false);
           await Promise.all([loadStats(), loadSidebar()]);
         } else if (evt.stage === "error") {
           genProgressWrap.style.display = "none";
