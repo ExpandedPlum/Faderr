@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -23,6 +24,8 @@ from models import init_db
 from services import deletion_service, triage_service
 from services.generation_service import runner as generation_runner
 from services.plex_service import plex
+from services.settings_service import store as settings
+from settings_api import router as settings_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,12 +50,14 @@ _PASSTHROUGH_HEADERS = (
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("Database initialized")
-    if not config.FADERR_PASSWORD:
+    await settings.load()  # also connects the Plex and Lidarr clients
+    if not settings.configured():
+        logger.warning("Faderr isn't set up yet: open the web UI to connect %s.", ", ".join(settings.missing()))
+    if not settings.password_required():
         logger.warning(
-            "FADERR_PASSWORD is not set: anyone who can reach this server can delete artists. "
-            "Set FADERR_PASSWORD in .env to require a login."
+            "No login password is set: anyone who can reach this server can delete artists. "
+            "Set one in the web UI (Settings) or with FADERR_PASSWORD."
         )
-    await plex.start()
     deletion_service.worker.start()
     try:
         yield
@@ -67,15 +72,34 @@ async def lifespan(app: FastAPI):
 BASE_DIR = Path(__file__).resolve().parent
 
 app = FastAPI(title="Faderr", lifespan=lifespan)
+app.include_router(settings_router)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 
 # ── Security ──────────────────────────────────────────────────────────────────
 
+# Checking a password against its scrypt hash is deliberately slow, and the
+# browser resends the login with every request (audio seeks included), so
+# logins that already passed are remembered until the password changes.
+_verified_logins: dict[str, str] = {}
+
+
+def _password_fingerprint() -> str:
+    """Changes whenever the password does, invalidating remembered logins."""
+    current = settings.current
+    if current.password_env:
+        return "env:" + hashlib.sha256(current.password_env.encode()).hexdigest()
+    return f"hash:{current.password_hash}"
+
+
 def _basic_auth_ok(header: Optional[str]) -> bool:
     if not header or not header.lower().startswith("basic "):
         return False
+    login_key = hashlib.sha256(header.encode()).hexdigest()
+    fingerprint = _password_fingerprint()
+    if _verified_logins.get(login_key) == fingerprint:
+        return True
     try:
         decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError):
@@ -84,19 +108,37 @@ def _basic_auth_ok(header: Optional[str]) -> bool:
     if not sep:
         return False
     user_ok = secrets.compare_digest(username.encode(), config.FADERR_USERNAME.encode())
-    pass_ok = secrets.compare_digest(password.encode(), config.FADERR_PASSWORD.encode())
-    return user_ok and pass_ok
+    if not (settings.check_password(password) and user_ok):
+        return False
+    if len(_verified_logins) > 100:
+        _verified_logins.clear()
+    _verified_logins[login_key] = fingerprint
+    return True
+
+
+# Reachable before setup is finished: the Settings page and its API.
+_SETUP_PATHS = ("/settings", "/api/settings", "/static/")
 
 
 @app.middleware("http")
 async def security(request: Request, call_next):
-    if config.FADERR_PASSWORD and not _basic_auth_ok(request.headers.get("authorization")):
+    await settings.refresh_if_stale()
+    if settings.password_required() and not _basic_auth_ok(request.headers.get("authorization")):
         return Response(
             "Authentication required", status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="Faderr", charset="UTF-8"'},
         )
     if request.method not in ("GET", "HEAD", "OPTIONS") and request.headers.get(CSRF_HEADER) != "1":
         return JSONResponse({"detail": "Missing request header"}, status_code=403)
+    path = request.url.path
+    if not settings.configured() and not path.startswith(_SETUP_PATHS):
+        if path.startswith("/api/"):
+            return JSONResponse(
+                {"detail": "Faderr isn't set up yet. Open Settings to connect Plex and Lidarr.",
+                 "setup_required": True},
+                status_code=503,
+            )
+        return RedirectResponse("/settings", status_code=303)
     return await call_next(request)
 
 
@@ -113,6 +155,11 @@ def _raise_for_result(result: dict) -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    return templates.TemplateResponse(request=request, name="settings.html")
 
 
 # ── Generation (SSE) ──────────────────────────────────────────────────────────
@@ -222,7 +269,9 @@ async def get_artist_tracks(artist_id: int):
 # the server, and the browser only needs to reach Faderr, not Plex.
 
 async def _proxy_plex(request: Request, path: str) -> StreamingResponse:
-    client: httpx.AsyncClient = plex.http
+    client: Optional[httpx.AsyncClient] = plex.http
+    if client is None:
+        raise HTTPException(status_code=503, detail="Plex isn't set up yet")
     headers = {}
     if "range" in request.headers:
         headers["Range"] = request.headers["range"]

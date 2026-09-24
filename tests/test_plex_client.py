@@ -28,7 +28,21 @@ class FakeServer:
 def client(monkeypatch):
     FakeServer.instances = 0
     monkeypatch.setattr(plex_service, "PlexServer", FakeServer)
-    return PlexClient("http://plex.test", "token")
+    c = PlexClient()
+    asyncio.run(c.configure("http://plex.test", "token", "Music"))
+    return c
+
+
+def test_unconfigured_client_says_so():
+    with pytest.raises(plex_service.NotConfiguredError):
+        asyncio.run(PlexClient().track_stream_key("1"))
+
+
+def test_reconfiguring_drops_the_old_connection(client):
+    client._server_conn()
+    asyncio.run(client.configure("http://other.test", "token2", "Music"))
+    client._server_conn()
+    assert FakeServer.instances == 2
 
 
 def test_connection_is_reused(client):

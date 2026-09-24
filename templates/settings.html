@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Faderr Settings</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="header-left">
+      <h1>Faderr</h1>
+    </div>
+    <div class="header-right">
+      <a id="link-back" href="/" class="btn btn-ghost">← Back to triage</a>
+    </div>
+  </header>
+
+  <main class="settings-main">
+    <div class="settings-wrap">
+
+      <section id="setup-banner" class="settings-card setup-banner hidden">
+        <h2>Welcome to Faderr</h2>
+        <p>Connect Plex and Lidarr to get started. Last.fm is optional.</p>
+        <p id="setup-missing" class="settings-hint"></p>
+      </section>
+
+      <!-- Login password -->
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <h3>Login password</h3>
+          <span id="password-status" class="settings-status"></span>
+        </div>
+        <p class="settings-hint">Anyone who can reach Faderr without a password can delete artists. You'll be asked for it by your browser; the username is <strong id="username">faderr</strong>.</p>
+        <div id="password-form" class="settings-row">
+          <input id="password-new" type="password" class="settings-input" placeholder="New password (8+ characters)" autocomplete="new-password" />
+          <button id="btn-password-save" class="btn btn-secondary">Set password</button>
+        </div>
+        <p id="password-env" class="settings-hint hidden">Set with <code>FADERR_PASSWORD</code> in .env.</p>
+      </section>
+
+      <!-- Plex -->
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <h3>Plex</h3>
+          <span id="plex-status" class="settings-status"></span>
+        </div>
+        <p id="plex-env" class="settings-hint hidden">Plex is configured in .env, so it's managed there.</p>
+
+        <div id="plex-editor">
+          <div class="settings-row">
+            <button id="btn-plex-signin" class="btn btn-secondary">Sign in with Plex</button>
+            <span id="plex-signin-status" class="settings-hint"></span>
+          </div>
+
+          <div id="plex-server-step" class="settings-row hidden">
+            <label for="plex-server">Server</label>
+            <select id="plex-server" class="settings-input"></select>
+            <button id="btn-plex-server" class="btn btn-secondary">Connect</button>
+          </div>
+
+          <div id="plex-library-step" class="settings-row hidden">
+            <label for="plex-library">Music library</label>
+            <select id="plex-library" class="settings-input"></select>
+            <button id="btn-plex-library" class="btn btn-secondary">Save</button>
+          </div>
+
+          <details class="settings-manual">
+            <summary>Enter the server URL and token yourself</summary>
+            <div class="settings-grid">
+              <label for="plex-url">Server URL</label>
+              <input id="plex-url" class="settings-input" placeholder="http://192.168.1.10:32400" />
+              <label for="plex-token">Token</label>
+              <input id="plex-token" type="password" class="settings-input" placeholder="Leave blank to keep the saved token" autocomplete="off" />
+              <label for="plex-manual-library">Music library</label>
+              <select id="plex-manual-library" class="settings-input"><option value="">Test first</option></select>
+            </div>
+            <div class="settings-row">
+              <button id="btn-plex-test" class="btn btn-ghost">Test</button>
+              <button id="btn-plex-manual-save" class="btn btn-secondary">Save</button>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <!-- Lidarr -->
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <h3>Lidarr</h3>
+          <span id="lidarr-status" class="settings-status"></span>
+        </div>
+        <p id="lidarr-env" class="settings-hint hidden">Lidarr is configured in .env, so it's managed there.</p>
+        <div id="lidarr-editor">
+          <div class="settings-grid">
+            <label for="lidarr-url">URL</label>
+            <input id="lidarr-url" class="settings-input" placeholder="http://192.168.1.10:8686" />
+            <label for="lidarr-key">API key</label>
+            <input id="lidarr-key" type="password" class="settings-input" placeholder="Lidarr → Settings → General → Security" autocomplete="off" />
+          </div>
+          <div class="settings-row">
+            <button id="btn-lidarr-save" class="btn btn-secondary">Test and save</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Last.fm -->
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <h3>Last.fm <span class="settings-optional">optional</span></h3>
+          <span id="lastfm-status" class="settings-status"></span>
+        </div>
+        <p class="settings-hint">Used to pick each artist's most popular track and show bios. Without it, Faderr picks a random track. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">Get a free API key</a>.</p>
+        <p id="lastfm-env" class="settings-hint hidden">Set with <code>LASTFM_API_KEY</code> in .env.</p>
+        <div id="lastfm-editor" class="settings-row">
+          <input id="lastfm-key" type="password" class="settings-input" placeholder="API key" autocomplete="off" />
+          <button id="btn-lastfm-save" class="btn btn-secondary">Test and save</button>
+          <button id="btn-lastfm-remove" class="btn btn-ghost hidden">Remove</button>
+        </div>
+      </section>
+
+      <section id="setup-done" class="settings-card hidden">
+        <p>All set. <a href="/">Start triaging →</a></p>
+      </section>
+    </div>
+  </main>
+
+  <!-- Modal -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-modal="true">
+      <h3 id="modal-title"></h3>
+      <p id="modal-message"></p>
+      <div id="modal-buttons" class="modal-buttons"></div>
+    </div>
+  </div>
+
+  <script src="/static/settings.js"></script>
+</body>
+</html>

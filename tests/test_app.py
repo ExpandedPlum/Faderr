@@ -1,17 +1,19 @@
 import base64
 import json
+import os
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
-from config import config
 from services import generation_service
 from services.plex_service import plex
-from tests.conftest import add_artists, all_artists, track
+from tests.conftest import add_artists, all_artists, reload_settings, track
 
 CSRF = {"X-Faderr-Request": "1"}
+PLEX_URL = os.environ["PLEX_URL"]
+PLEX_TOKEN = os.environ["PLEX_TOKEN"]
 
 
 @pytest.fixture
@@ -35,8 +37,8 @@ def plex_requests(client):
 
     original = plex.http
     plex.http = httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url=config.PLEX_URL,
-        headers={"X-Plex-Token": config.PLEX_TOKEN},
+        transport=httpx.MockTransport(handler), base_url=PLEX_URL,
+        headers={"X-Plex-Token": PLEX_TOKEN},
     )
     yield seen
     plex.http = original
@@ -45,7 +47,8 @@ def plex_requests(client):
 # ── Auth / CSRF ──────────────────────────────────────────────────────────────
 
 def test_auth_required_when_password_set(client, monkeypatch):
-    monkeypatch.setattr(config, "FADERR_PASSWORD", "hunter2")
+    monkeypatch.setenv("FADERR_PASSWORD", "hunter2")
+    reload_settings()
     assert client.get("/api/stats").status_code == 401
     bad = base64.b64encode(b"faderr:wrong").decode()
     assert client.get("/api/stats", headers={"Authorization": f"Basic {bad}"}).status_code == 401
@@ -70,7 +73,7 @@ def test_stream_key_redirect_endpoint_is_gone(client):
 def test_artist_json_has_no_token(client):
     add_artists({"artist_name": "A", "thumb_url": "/library/metadata/1/thumb/123"})
     body = client.get("/api/artists").text
-    assert config.PLEX_TOKEN not in body
+    assert PLEX_TOKEN not in body
     assert "/api/artists/" in body
 
 
@@ -80,15 +83,15 @@ def test_stream_is_proxied_with_range(client, plex_requests):
     assert resp.status_code == 206
     assert resp.content == b"part"
     assert resp.headers["content-range"] == "bytes 0-3/100"
-    assert config.PLEX_TOKEN not in str(resp.headers)
+    assert PLEX_TOKEN not in str(resp.headers)
     (req,) = plex_requests
     assert req.url.path == "/library/parts/5/1600/file.flac"
-    assert req.headers["x-plex-token"] == config.PLEX_TOKEN
+    assert req.headers["x-plex-token"] == PLEX_TOKEN
     assert req.headers["range"] == "bytes=0-3"
 
 
 def test_legacy_thumb_url_only_uses_path(client, plex_requests):
-    legacy = f"{config.PLEX_URL}/library/metadata/1/thumb/123?X-Plex-Token={config.PLEX_TOKEN}"
+    legacy = f"{PLEX_URL}/library/metadata/1/thumb/123?X-Plex-Token={PLEX_TOKEN}"
     (artist_id,) = add_artists({"artist_name": "A", "thumb_url": legacy})
     resp = client.get(f"/api/artists/{artist_id}/thumb")
     assert resp.status_code == 200

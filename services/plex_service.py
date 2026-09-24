@@ -19,7 +19,6 @@ import requests
 from plexapi.audio import Track
 from plexapi.server import PlexServer
 
-from config import config
 
 logger = logging.getLogger(__name__)
 
@@ -91,8 +90,8 @@ def _artist_tracks(server: PlexServer, artist_rating_key: str) -> list:
     return server.fetchItems(f"/library/metadata/{int(artist_rating_key)}/allLeaves", cls=Track)
 
 
-def _all_artists(server: PlexServer) -> list[dict]:
-    section = server.library.section(config.PLEX_MUSIC_LIBRARY)
+def _all_artists(server: PlexServer, library: str) -> list[dict]:
+    section = server.library.section(library)
     # includeGuids (plexapi's default) puts MusicBrainz IDs in this same listing
     artists = section.all(libtype="artist", includeGuids=True)
     return [
@@ -164,22 +163,41 @@ def _delete_artist(server: PlexServer, artist_rating_key: str) -> None:
 
 # ── Client ────────────────────────────────────────────────────────────────────
 
+class NotConfiguredError(RuntimeError):
+    """Raised when Plex hasn't been set up yet (see the Settings page)."""
+
+
 class PlexClient:
-    def __init__(self, url: str, token: str):
-        self._url = url
-        self._token = token
+    """Connection details come from the settings store, which calls
+    configure() at startup and whenever they change in the web UI."""
+
+    def __init__(self):
+        self._url: Optional[str] = None
+        self._token: Optional[str] = None
+        self._library: Optional[str] = None
         self._server: Optional[PlexServer] = None
         self._server_lock = threading.Lock()
-        # Async HTTP client for streaming media through the app's proxy.
-        # Created in start(), because it belongs to the running event loop.
+        # Async HTTP client for streaming media through the app's proxy. It
+        # belongs to the running event loop, so it's made in configure().
         self.http: Optional[httpx.AsyncClient] = None
 
-    async def start(self) -> None:
+    @property
+    def configured(self) -> bool:
+        return bool(self._url and self._token and self._library)
+
+    async def configure(self, url: Optional[str], token: Optional[str], library: Optional[str]) -> None:
+        """Point the client at a (new) server. Existing connections are dropped."""
+        old_http = self.http
+        with self._server_lock:
+            self._url, self._token, self._library = url, token, library
+            self._server = None
         self.http = httpx.AsyncClient(
-            base_url=self._url.rstrip("/"),
-            headers={"X-Plex-Token": self._token},
+            base_url=url.rstrip("/"),
+            headers={"X-Plex-Token": token},
             timeout=httpx.Timeout(15.0, read=60.0),
-        )
+        ) if url and token else None
+        if old_http is not None:
+            await old_http.aclose()
 
     async def aclose(self) -> None:
         if self.http is not None:
@@ -188,6 +206,8 @@ class PlexClient:
 
     def _server_conn(self) -> PlexServer:
         with self._server_lock:
+            if not self.configured:
+                raise NotConfiguredError("Plex isn't set up yet. Open Settings to connect it.")
             if self._server is None:
                 self._server = PlexServer(self._url, self._token)
             return self._server
@@ -216,7 +236,7 @@ class PlexClient:
     async def all_artists(self) -> list[dict]:
         """Every artist in the music library: name, rating_key, thumb (a Plex
         path, no host or token) and mbid (MusicBrainz ID, if Plex has one)."""
-        return await self._call(_all_artists)
+        return await self._call(_all_artists, self._library)
 
     async def resolve_track(
         self, artist_rating_key: str, lastfm_title: Optional[str], keep_track_key: Optional[str] = None,
@@ -245,4 +265,4 @@ class PlexClient:
         await self._call(_delete_artist, artist_rating_key, retry=False)
 
 
-plex = PlexClient(config.PLEX_URL, config.PLEX_TOKEN)
+plex = PlexClient()
