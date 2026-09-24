@@ -21,6 +21,7 @@
     </div>
     <div class="header-right">
       <button id="btn-generate" class="btn">Generate Playlist</button>
+      <button id="btn-sync-playlist" class="btn" title="Rebuild the Plex playlist from the current queue">Sync Plex Playlist</button>
       <button id="btn-history" class="btn">History</button>
     </div>
   </header>
@@ -47,7 +48,6 @@
           <button class="sf-btn active" data-status="">All</button>
           <button class="sf-btn" data-status="undecided">Undecided</button>
           <button class="sf-btn" data-status="keep">Keep</button>
-          <button class="sf-btn" data-status="explore">Exploring</button>
           <button class="sf-btn" data-status="delete">Deleted</button>
         </div>
       </div>
@@ -96,10 +96,16 @@
               <button id="btn-delete"  class="btn btn-delete"  title="Delete artist (D)">Delete</button>
             </div>
 
-            <p id="deleted-note" class="deleted-note hidden">This artist has been deleted. Its files are gone, so no other decision can be made.</p>
+            <div id="deleted-note" class="deleted-note hidden">
+              <p id="deleted-note-text"></p>
+              <div class="confirm-buttons">
+                <button id="btn-undo-delete" class="btn btn-ghost btn-sm hidden">Undo delete</button>
+                <button id="btn-retry-delete" class="btn btn-ghost btn-sm hidden">Retry delete</button>
+              </div>
+            </div>
 
             <div id="delete-confirm" class="delete-confirm hidden">
-              <p>Delete <strong id="delete-artist-name"></strong> from your library and disk?</p>
+              <p>Delete <strong id="delete-artist-name"></strong> from your library and disk? You can undo it from History until the delete runs.</p>
               <div class="confirm-buttons">
                 <button id="btn-delete-confirm" class="btn btn-delete">Yes, Delete</button>
                 <button id="btn-delete-cancel"  class="btn btn-ghost">Cancel</button>
@@ -129,7 +135,7 @@
       <section id="section-empty" class="card empty-card">
         <h2>No playlist yet</h2>
         <p>Click <strong>Generate Playlist</strong> to get started.</p>
-        <p class="kbd-hint">Keyboard shortcuts: <kbd>K</kbd> Keep · <kbd>E</kbd> Explore · <kbd>D</kbd> Delete · <kbd>←</kbd><kbd>→</kbd> Navigate · <kbd>Space</kbd> Play/Pause · <kbd>/</kbd> Search</p>
+        <p class="kbd-hint">Keyboard shortcuts: <kbd>K</kbd> Keep · <kbd>E</kbd> Listen to more · <kbd>D</kbd> Delete · <kbd>←</kbd><kbd>→</kbd> Navigate · <kbd>Space</kbd> Play/Pause · <kbd>/</kbd> Search</p>
       </section>
 
       <!-- Progress bar -->
@@ -152,8 +158,6 @@
         <div class="history-filters">
           <button class="filter-btn active" data-filter="">All</button>
           <button class="filter-btn" data-filter="keep">Keep</button>
-          <button class="filter-btn" data-filter="explore_keep">Kept (via Explore)</button>
-          <button class="filter-btn" data-filter="explore">Exploring</button>
           <button class="filter-btn" data-filter="delete">Deleted</button>
         </div>
         <ul id="history-list" class="history-list"></ul>

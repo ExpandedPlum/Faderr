@@ -42,23 +42,29 @@ Open `http://localhost:8811`, click **Generate Playlist**, and start triaging.
 3. **Decide** — For each artist, you can:
    - **Keep** — stays in your library, marked done in the triage queue
    - **Listen to More** — queues up additional tracks from that artist in the player
-   - **Delete** — removes the artist from Lidarr and permanently deletes their files from disk
+   - **Delete** — queues the artist for deletion. After a grace period (5 minutes by default) Faderr removes it from Lidarr and permanently deletes its files from disk
 
-4. **Repeat** — Undo any non-delete decision from the History panel (deletes can't be undone). Regenerate at any time to refresh undecided artists without affecting previous decisions.
+4. **Repeat** — Undo a Keep at any time, or a Delete until it runs, from the History panel. Regenerate at any time to pick up library changes without affecting previous decisions.
 
 ---
 
 ## ⚠️ Deletion is permanent
 
-When you delete an artist, Faderr instructs Lidarr to remove them with `deleteFiles=true`. **This cannot be undone from within Faderr.** Deleted artists have no Undo button in History.
+When a delete runs, Faderr instructs Lidarr to remove the artist with `deleteFiles=true`. **Once it has run, it cannot be undone from within Faderr.**
+
+Deletes don't run the moment you choose them:
+- **Grace period:** a delete waits `DELETE_GRACE_SECONDS` (default 300, i.e. 5 minutes; `0` runs immediately). Until then, **Undo** in History (or on the artist) cancels it and restores the artist's previous decision.
+- **Queue and audit log:** each delete is a recorded job. History shows whether it is waiting, running, done or failed, and the record keeps how the files were removed (Lidarr or Plex), which Lidarr artist and folder were matched, and any error. `GET /api/deletions` returns the full log.
+- **Failures wait for you:** a failed delete stays failed, with the reason, until you **Retry** or **Undo** it. If the server stops in the middle of a delete, that job is marked as interrupted rather than silently re-run, so you can check Lidarr and Plex first.
+- **Survives restarts:** pending deletes are stored in the database and run after a restart.
 
 Faderr only deletes when it can tell exactly which files belong to the artist:
-- The Lidarr artist is found by matching its **folder** against the file paths Plex reports, not just by name. This keeps two artists with the same name (or names in non-Latin scripts) from being confused.
+- The Lidarr artist is found by matching its **folder** against the file paths Plex reports, not just by name. This keeps two artists with the same name (or names in non-Latin scripts) from being confused. When Plex knows the artist's MusicBrainz ID, it must match the Lidarr artist's ID as well; if the ID and the folder disagree, nothing is deleted.
 - If Lidarr is unreachable, or the match is ambiguous (for example, a Lidarr artist has the same name but a different folder), **nothing is deleted** and you get an explanation instead.
 - Files are only deleted through Plex when Lidarr definitely doesn't manage the artist, or after Lidarr has been told to stop monitoring it, so Lidarr won't download them again.
 - By default, deleted artists are added to Lidarr's import list exclusions so import lists don't re-add them (`LIDARR_ADD_IMPORT_EXCLUSION`).
 - If a Lidarr delete times out, Faderr asks Lidarr whether the artist is gone before doing anything else, and never deletes through Plex while Lidarr might still be working.
-- A deleted artist can't be given any other decision, and only one decision per artist runs at a time.
+- A deleted (or pending-delete) artist can't be given any other decision. These rules are enforced by the database, so they hold even with several server processes.
 
 Before using the delete action at scale:
 - Confirm your Lidarr recycle bin or backup is configured if you want a safety net
@@ -70,12 +76,13 @@ Before using the delete action at scale:
 
 - Built-in audio player — stream directly from Plex, no app switching
 - Responsive layout — off-canvas sidebar drawer, large tap targets, single-column triage view on mobile
-- Sidebar with search and filter by decision status (All / Undecided / Keep / Exploring / Deleted)
+- Sidebar with search and filter by decision status (All / Undecided / Keep / Deleted)
 - Keyboard shortcuts: `K` keep · `E` listen to more · `D` delete · `←` `→` navigate · `Space` play/pause · `/` search
 - Last.fm artist bio pulled automatically
 - Skip track to try a different song before deciding
 - Live generation progress streamed to the header via SSE
-- History panel with undo support for non-delete decisions
+- History panel with undo, delete status, and retry for failed deletes
+- Plex playlist of the current queue, rebuilt after each generation or on demand with **Sync Plex Playlist**
 - Dark mode
 
 ---
@@ -107,7 +114,7 @@ LIDARR_API_KEY=your_lidarr_api_key_here
 FADERR_PASSWORD=choose_a_password
 ```
 
-Optional settings: `FADERR_USERNAME`, `LIDARR_ADD_IMPORT_EXCLUSION` (default `true`), `TRIAGE_PLAYLIST_NAME`, `DATABASE_URL`.
+Optional settings: `FADERR_USERNAME`, `DELETE_GRACE_SECONDS` (default `300`), `LIDARR_ADD_IMPORT_EXCLUSION` (default `true`), `TRIAGE_PLAYLIST_NAME`, `DATABASE_URL`.
 
 **Finding your Plex token:** Plex Web → any media item → ··· → Get Info → View XML → find `X-Plex-Token` in the URL.
 
@@ -130,7 +137,10 @@ For persistent home server deployment, run under `systemd` or your container's p
 ## Operational notes
 
 - **First run:** Generation can take a few minutes on large libraries due to Last.fm rate limiting. Progress streams live in the header. Generation runs on the server, so closing the tab doesn't stop it; reopening the page picks the progress back up, and a second Generate click joins the run already in progress.
-- **Regenerating:** Refreshes all undecided artists. Already-decided artists are not affected. Artists are tracked by their Plex ID, so two different artists with the same name are triaged separately. If Plex fails to load one artist's tracks, that artist is skipped (and listed when generation finishes) rather than failing the whole run.
+- **Regenerating:** Updates the queue in place. Undecided artists keep their place, notes, and any track you picked with Skip (if it's still in Plex); new artists are added; undecided artists no longer in Plex are removed. Decided artists are never changed. Artists are tracked by their Plex ID, so two different artists with the same name are triaged separately. If Plex fails to load one artist's tracks, that artist is skipped (and listed when generation finishes) rather than failing the whole run.
+- **Plex playlist:** The "Artist Triage" playlist in Plex holds one track per undecided artist. It is rebuilt after each generation and with **Sync Plex Playlist**, not after every decision, so it can lag behind until you sync.
+- **Upgrades:** The database schema is versioned. On startup Faderr applies any pending migrations in one transaction, and first saves a copy of the database next to it (e.g. `triage.db.pre-v3.bak`). Upgrading to this version merges any duplicate rows for the same artist and folds the old "Exploring" state into undecided (and "Kept via explore" into Keep).
+- **Multiple workers:** Safe. Decisions, the generation lock and the deletion queue are coordinated through the database, so running uvicorn with `--workers` doesn't break them.
 - **Deletion flow:** Faderr calls Lidarr's delete endpoint. Lidarr handles file removal on the media server. Empty folders can be cleaned via Lidarr → System → Scheduled Tasks → "Clean Up Recycle Bin", or by enabling **Settings → Media Management → Delete Empty Folders**.
 - **Artists not in Lidarr:** If an artist's files aren't in any Lidarr artist folder, deletion goes through the Plex API instead (Plex's "Allow media deletion" setting must be on).
 
@@ -144,8 +154,8 @@ Check that `PLEX_URL` and `PLEX_TOKEN` are correct. Visit `http://YOUR_PLEX_URL/
 **Artists are missing after generation**
 Artists with no tracks in Plex are skipped. Artists added manually to Plex (not managed by Lidarr) still appear and are deleted through Plex.
 
-**"Not deleting …" when deleting an artist**
-Faderr couldn't safely tell which Lidarr artist owns the files: Lidarr was unreachable, or a Lidarr artist has the same name but its folder isn't where Plex finds the files. Nothing was deleted. Retry once Lidarr is reachable, or delete the artist manually in Lidarr.
+**A delete shows "Delete failed"**
+Hover the status in History (or open the artist) to see why. Common reasons: Lidarr was unreachable; a Lidarr artist has the same name (or MusicBrainz ID) but its folder isn't where Plex finds the files; Plex couldn't be reached. Nothing was deleted. Fix the cause and **Retry**, or **Undo** and delete the artist manually in Lidarr.
 
 **Last.fm bio or top track not loading**
 Last.fm returns no data for some artists. Faderr falls back to a random track silently — this is expected behavior, not an error.
@@ -163,13 +173,15 @@ Normal for large libraries. Faderr uses concurrency limiting and automatic backo
 ```
 ├── app.py                  # FastAPI app and routes
 ├── config.py               # Environment variable loading
-├── models.py               # SQLite database model
+├── models.py               # Database models and SQLite setup
+├── migrations.py           # Numbered schema migrations (the schema's source of truth)
 ├── services/
-│   ├── plex_service.py     # Plex API interactions
+│   ├── plex_service.py     # Long-lived async Plex client
 │   ├── lastfm_service.py   # Last.fm API interactions
-│   ├── lidarr_service.py   # Lidarr API interactions and artist matching
-│   ├── triage_service.py   # Core triage logic
-│   └── generation_runner.py # Background playlist generation
+│   ├── lidarr_service.py   # Async Lidarr client and artist matching
+│   ├── triage_service.py   # Queue reads, decisions, playlist sync
+│   ├── generation_service.py # Building the queue; the shared generation lock
+│   └── deletion_service.py # Deletion jobs, the safe delete routine, the worker
 ├── tests/                  # pytest suite
 ├── static/
 │   ├── app.js

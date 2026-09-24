@@ -59,3 +59,40 @@ def test_windows_paths_and_case_differences():
     artists = [lidarr(3, "Björk", "Björk")]
     match = resolve_artist("Bjork", [r"D:\Music\BJÖRK\Debut\01.flac"], artists)
     assert match.lidarr_id == 3
+
+
+# ── MusicBrainz IDs ───────────────────────────────────────────────────────────
+
+def mb(id_, name, folder, mbid):
+    return {**lidarr(id_, name, folder), "foreignArtistId": mbid}
+
+
+def test_mbid_picks_between_several_folder_matches():
+    # Both folders appear in the paths and names don't help; the MBID decides
+    artists = [mb(1, "X", "Shared", "aaa"), mb(2, "Y", "Solo", "bbb")]
+    match = resolve_artist("Z", ["/music/Shared/Solo/01.flac"], artists, mbid="bbb")
+    assert (match.lidarr_id, match.folder) == (2, "Solo")
+
+
+def test_mbid_match_must_also_match_folder():
+    artists = [mb(1, "Nirvana", "Nirvana (US)", "aaa")]
+    match = resolve_artist("Nirvana", ["/music/Nirvana (UK)/01.flac"], artists, mbid="aaa")
+    assert match.lidarr_id is None and match.ambiguous
+
+
+def test_mbid_pointing_elsewhere_overrides_a_folder_match():
+    # The folder says artist 1, Plex's MBID says artist 2: something is wrong, so don't guess
+    artists = [mb(1, "Band", "Band", "aaa"), mb(2, "Band", "Band 2", "bbb")]
+    match = resolve_artist("Band", ["/music/Band/01.flac"], artists, mbid="bbb")
+    assert match.ambiguous
+
+
+def test_unknown_mbid_falls_back_to_folder():
+    artists = [mb(1, "Band", "Band", "aaa")]
+    match = resolve_artist("Band", ["/music/Band/01.flac"], artists, mbid="not-in-lidarr")
+    assert match.lidarr_id == 1
+
+
+def test_mbid_comparison_ignores_case():
+    artists = [mb(1, "Band", "Band", "AbC")]
+    assert resolve_artist("Band", ["/music/Band/01.flac"], artists, mbid="abc").lidarr_id == 1
