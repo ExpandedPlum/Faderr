@@ -44,18 +44,23 @@ Open `http://localhost:8811`, click **Generate Playlist**, and start triaging.
    - **Listen to More** — queues up additional tracks from that artist in the player
    - **Delete** — removes the artist from Lidarr and permanently deletes their files from disk
 
-4. **Repeat** — Undo any non-delete decision from the History panel. Regenerate at any time to refresh undecided artists without affecting previous decisions.
+4. **Repeat** — Undo any non-delete decision from the History panel (deletes can't be undone). Regenerate at any time to refresh undecided artists without affecting previous decisions.
 
 ---
 
 ## ⚠️ Deletion is permanent
 
-When you delete an artist, Faderr instructs Lidarr to remove them with `deleteFiles=true`. **This cannot be undone from within Faderr.**
+When you delete an artist, Faderr instructs Lidarr to remove them with `deleteFiles=true`. **This cannot be undone from within Faderr.** Deleted artists have no Undo button in History.
+
+Faderr only deletes when it can tell exactly which files belong to the artist:
+- The Lidarr artist is found by matching its **folder** against the file paths Plex reports, not just by name. This keeps two artists with the same name (or names in non-Latin scripts) from being confused.
+- If Lidarr is unreachable, or the match is ambiguous (for example, a Lidarr artist has the same name but a different folder), **nothing is deleted** and you get an explanation instead.
+- Files are only deleted through Plex when Lidarr definitely doesn't manage the artist, or after Lidarr has been told to stop monitoring it, so Lidarr won't download them again.
+- By default, deleted artists are added to Lidarr's import list exclusions so import lists don't re-add them (`LIDARR_ADD_IMPORT_EXCLUSION`).
 
 Before using the delete action at scale:
 - Confirm your Lidarr recycle bin or backup is configured if you want a safety net
 - Test on a small set of artists first to verify the Lidarr connection is working
-- The undo button in History **does not** restore deleted files — it only clears the database record
 
 ---
 
@@ -95,13 +100,20 @@ PLEX_MUSIC_LIBRARY=Music
 LASTFM_API_KEY=your_lastfm_api_key_here
 LIDARR_URL=http://192.168.1.x:8686
 LIDARR_API_KEY=your_lidarr_api_key_here
+
+# Recommended: require a login (username defaults to "faderr")
+FADERR_PASSWORD=choose_a_password
 ```
+
+Optional settings: `FADERR_USERNAME`, `LIDARR_ADD_IMPORT_EXCLUSION` (default `true`), `TRIAGE_PLAYLIST_NAME`, `DATABASE_URL`.
 
 **Finding your Plex token:** Plex Web → any media item → ··· → Get Info → View XML → find `X-Plex-Token` in the URL.
 
 **Finding your Lidarr API key:** Lidarr → Settings → General → Security.
 
 > **Security:** never commit `.env` to version control. It is already in `.gitignore`, but double-check before pushing to a public repository.
+>
+> Set `FADERR_PASSWORD`. Without it, anyone who can reach Faderr on your network can delete artists (Faderr logs a warning at startup). Audio and artwork are fetched from Plex by the server, so your Plex token is never sent to the browser.
 
 ### Run
 
@@ -115,10 +127,10 @@ For persistent home server deployment, run under `systemd` or your container's p
 
 ## Operational notes
 
-- **First run:** Generation can take a few minutes on large libraries due to Last.fm rate limiting. Progress streams live in the header.
+- **First run:** Generation can take a few minutes on large libraries due to Last.fm rate limiting. Progress streams live in the header. Generation runs on the server, so closing the tab doesn't stop it; reopening the page picks the progress back up, and a second Generate click joins the run already in progress.
 - **Regenerating:** Refreshes all undecided artists. Already-decided artists are not affected.
 - **Deletion flow:** Faderr calls Lidarr's delete endpoint. Lidarr handles file removal on the media server. Empty folders can be cleaned via Lidarr → System → Scheduled Tasks → "Clean Up Recycle Bin", or by enabling **Settings → Media Management → Delete Empty Folders**.
-- **Artists not in Lidarr:** If an artist was added to Plex outside of Lidarr, deletion falls back to the Plex API.
+- **Artists not in Lidarr:** If an artist's files aren't in any Lidarr artist folder, deletion goes through the Plex API instead (Plex's "Allow media deletion" setting must be on).
 
 ---
 
@@ -128,16 +140,19 @@ For persistent home server deployment, run under `systemd` or your container's p
 Check that `PLEX_URL` and `PLEX_TOKEN` are correct. Visit `http://YOUR_PLEX_URL/library/sections?X-Plex-Token=YOUR_TOKEN` in a browser — a valid token returns an XML response.
 
 **Artists are missing after generation**
-Faderr matches Plex artists to Lidarr by normalizing names. Artists added manually to Plex (not managed by Lidarr) can still appear but fall back to Plex for deletion.
+Artists with no tracks in Plex are skipped. Artists added manually to Plex (not managed by Lidarr) still appear and are deleted through Plex.
+
+**"Not deleting …" when deleting an artist**
+Faderr couldn't safely tell which Lidarr artist owns the files: Lidarr was unreachable, or a Lidarr artist has the same name but its folder isn't where Plex finds the files. Nothing was deleted. Retry once Lidarr is reachable, or delete the artist manually in Lidarr.
 
 **Last.fm bio or top track not loading**
 Last.fm returns no data for some artists. Faderr falls back to a random track silently — this is expected behavior, not an error.
 
 **Audio won't play**
-The player streams directly from Plex. Verify that `PLEX_URL` is reachable from the browsing device, not just the server itself. Library names and tokens are case-sensitive.
+Faderr streams audio from Plex through the server. Check that `PLEX_URL` is reachable from the machine running Faderr and that the token is correct. Library names and tokens are case-sensitive.
 
 **Last.fm rate limit errors during generation**
-Normal for large libraries. Faderr uses concurrency limiting and automatic backoff — let it run. If it stops partway through, re-running Generate skips already-decided artists and resumes from where it left off.
+Normal for large libraries. Faderr uses concurrency limiting and automatic backoff — let it run. If it fails partway through, run Generate again: it starts over, but decisions you've already made are kept.
 
 ---
 
@@ -150,16 +165,28 @@ Normal for large libraries. Faderr uses concurrency limiting and automatic backo
 ├── services/
 │   ├── plex_service.py     # Plex API interactions
 │   ├── lastfm_service.py   # Last.fm API interactions
-│   ├── lidarr_service.py   # Lidarr API interactions
-│   └── triage_service.py   # Core triage logic
+│   ├── lidarr_service.py   # Lidarr API interactions and artist matching
+│   ├── triage_service.py   # Core triage logic
+│   └── generation_runner.py # Background playlist generation
+├── tests/                  # pytest suite
 ├── static/
 │   ├── app.js
 │   └── style.css
 ├── templates/
 │   └── index.html
 ├── .env.example
-└── requirements.txt
+├── requirements.txt
+└── requirements-dev.txt
 ```
+
+## Running tests
+
+```bash
+venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+venv/bin/python -m pytest
+```
+
+The tests use a temporary SQLite database and fake Plex/Lidarr responses; they don't touch your real servers.
 
 ---
 

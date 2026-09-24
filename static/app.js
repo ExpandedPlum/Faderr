@@ -95,11 +95,11 @@ function loadAudio(artistId, autoplay = true) {
 
 function loadQueueTrack(index) {
   const track = trackQueue[index];
-  if (!track || !track.stream_key) {
+  if (!track || !track.rating_key) {
     audioStatus.textContent = "No more tracks";
     return;
   }
-  const url = `/api/stream-key?key=${encodeURIComponent(track.stream_key)}`;
+  const url = `/api/tracks/${encodeURIComponent(track.rating_key)}/stream`;
   audio.src = url;
   audio.load();
   audioStatus.textContent = "";
@@ -168,12 +168,16 @@ audioSeek.addEventListener("change", () => {
     audio.currentTime = (audioSeek.value / 100) * audio.duration;
     audioSeek.style.setProperty("--pct", audioSeek.value + "%");
   }
+  audioSeek.blur();
 });
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+// Sent on every request; the server rejects state-changing requests without it (CSRF protection)
+const CSRF_HEADERS = { "X-Faderr-Request": "1" };
+
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+  const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...CSRF_HEADERS, ...(opts.headers || {}) } });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status}: ${text}`);
@@ -189,13 +193,19 @@ function esc(str) {
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
 
+let sidebarSeq = 0;
+
 async function loadSidebar() {
+  const seq = ++sidebarSeq;
   const params = new URLSearchParams();
   if (sidebarFilter) params.set("status", sidebarFilter);
   if (sidebarSearch) params.set("search", sidebarSearch);
+  let artists;
   try {
-    sidebarArtists = await api(`/api/artists?${params}`);
+    artists = await api(`/api/artists?${params}`);
   } catch(e) { return; }
+  if (seq !== sidebarSeq) return;  // a newer search/filter has been requested
+  sidebarArtists = artists;
 
   const list = $("sidebar-list");
   list.innerHTML = "";
@@ -221,9 +231,10 @@ function updateSidebarActive() {
 
 // ── Artist bio ─────────────────────────────────────────────────────────────
 
-async function loadBio(artistId, artistName) {
+async function loadBio(artistId) {
   try {
     const data = await api(`/api/artists/${artistId}/bio`);
+    if (!focusedArtist || focusedArtist.id !== artistId) return;  // user moved on
     if (data.bio) {
       artistBio.textContent = data.bio;
       artistBioWrap.classList.remove("hidden");
@@ -235,13 +246,17 @@ async function loadBio(artistId, artistName) {
 
 // ── Focus an artist ────────────────────────────────────────────────────────
 
+let focusSeq = 0;
+
 async function focusArtist(id, autoplay = true) {
   // Close mobile drawer when an artist is selected
   if (window.innerWidth <= 768) closeMobileDrawer();
 
+  const seq = ++focusSeq;
   let data;
   try { data = await api(`/api/artists/${id}`); }
   catch(e) { console.error("focusArtist:", e); return; }
+  if (seq !== focusSeq) return;  // a newer navigation superseded this one
 
   const artistChanged = !focusedArtist || focusedArtist.id !== data.id;
   focusedArtist = data;
@@ -258,7 +273,7 @@ async function focusArtist(id, autoplay = true) {
   // Load bio async — clear first so stale bio doesn't linger
   artistBioWrap.classList.add("hidden");
   artistBio.textContent = "";
-  if (artistChanged) loadBio(data.id, data.artist_name);
+  if (artistChanged) loadBio(data.id);
 
   if (data.thumb) { artistThumb.src = data.thumb; artistThumb.style.display = ""; }
   else { artistThumb.src = ""; artistThumb.style.display = "none"; }
@@ -315,10 +330,14 @@ async function loadStats() {
 
 // ── History ────────────────────────────────────────────────────────────────
 
+let historySeq = 0;
+
 async function loadHistory() {
+  const seq = ++historySeq;
   const url = historyFilter ? `/api/artists/history?decision=${encodeURIComponent(historyFilter)}` : "/api/artists/history";
   let artists;
   try { artists = await api(url); } catch(e) { return; }
+  if (seq !== historySeq) return;
   const list = $("history-list");
   list.innerHTML = "";
   if (artists.length === 0) {
@@ -502,9 +521,11 @@ async function startGenerationStream() {
   $("btn-generate").disabled = true;
 
   let total = 0;
+  let finished = false;  // saw a "done" or "error" event
 
   try {
-    const resp = await fetch("/api/generate/stream", { method: "POST" });
+    // Starts a run, or joins the one already in progress
+    const resp = await fetch("/api/generate/stream", { method: "POST", headers: CSRF_HEADERS });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -517,7 +538,7 @@ async function startGenerationStream() {
       const lines = buf.split("\n\n");
       buf = lines.pop();
       for (const chunk of lines) {
-        if (!chunk.startsWith("data: ")) continue;
+        if (!chunk.startsWith("data: ")) continue;  // e.g. keepalive comments
         let evt;
         try { evt = JSON.parse(chunk.slice(6)); } catch { continue; }
 
@@ -541,21 +562,34 @@ async function startGenerationStream() {
           genProgressLabel.textContent = "Creating Plex playlist…";
           genProgressBar.style.width = "95%";
         } else if (evt.stage === "done") {
+          finished = true;
           genProgressBar.style.width = "100%";
           genProgressLabel.textContent = `Done! ${evt.total_artists} artists added.`;
           setTimeout(() => {
             genProgressWrap.style.display = "none";
           }, 3000);
-          showModal("Playlist Ready", `"${evt.playlist_name}" created with ${evt.total_artists} artists.`, [
+          const message = evt.playlist_warning
+            ? `${evt.total_artists} artists are ready to triage. ${evt.playlist_warning}`
+            : `"${evt.playlist_name}" created with ${evt.total_artists} artists.`;
+          showModal("Playlist Ready", message, [
             { label: "OK", primary: true, action: () => {} },
           ]);
           await loadInitial(false);
           await Promise.all([loadStats(), loadSidebar()]);
         } else if (evt.stage === "error") {
+          finished = true;
           genProgressWrap.style.display = "none";
           showModal("Generation Failed", evt.message || "Unknown error", [{ label:"OK", primary:true, action:()=>{} }]);
         }
       }
+    }
+    if (!finished) {
+      genProgressWrap.style.display = "none";
+      showModal(
+        "Lost connection",
+        "The connection to the server dropped. Generation keeps running on the server; reload the page to follow its progress.",
+        [{ label:"OK", primary:true, action:()=>{} }]
+      );
     }
   } catch(e) {
     genProgressWrap.style.display = "none";
@@ -567,9 +601,19 @@ async function startGenerationStream() {
 
 // ── Keyboard shortcuts ─────────────────────────────────────────────────────
 
+function modalOpen() {
+  return !$("modal-backdrop").classList.contains("hidden");
+}
+
 window.addEventListener("keydown", e => {
-  // Skip when typing in inputs/textareas
-  if (e.target.matches("input, textarea, select, button")) return;
+  if (modalOpen()) {
+    if (e.key === "Escape") $("modal-backdrop").classList.add("hidden");
+    return;
+  }
+  // Skip when typing in inputs/textareas. Buttons are deliberately NOT skipped:
+  // a clicked button keeps focus, and skipping it would disable every shortcut
+  // (and let Space press that button) until the user clicked elsewhere.
+  if (e.target.matches("input, textarea, select")) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
 
   switch (e.key) {
@@ -595,7 +639,9 @@ window.addEventListener("keydown", e => {
       break;
     case " ":
       e.preventDefault();
-      if (audio.paused) audio.play(); else audio.pause();
+      // Release focus from any button so Space doesn't also activate it on keyup
+      if (document.activeElement && document.activeElement.tagName === "BUTTON") document.activeElement.blur();
+      if (audio.paused) audio.play().catch(() => {}); else audio.pause();
       break;
     case "/":
       e.preventDefault();
@@ -609,4 +655,7 @@ window.addEventListener("keydown", e => {
 (async () => {
   await loadInitial();
   await Promise.all([loadStats(), loadSidebar()]);
+  // Re-attach to a generation that is still running (e.g. after a reload)
+  const status = await api("/api/generate/status").catch(() => null);
+  if (status && status.running) startGenerationStream();
 })();

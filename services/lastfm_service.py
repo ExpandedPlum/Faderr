@@ -8,7 +8,7 @@ from config import config
 
 logger = logging.getLogger(__name__)
 
-LASTFM_BASE = "http://ws.audioscrobbler.com/2.0/"
+LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 _SEMAPHORE = asyncio.Semaphore(5)
 
 

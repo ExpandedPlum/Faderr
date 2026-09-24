@@ -38,7 +38,8 @@ class TriageArtist(Base):
             "id": self.id,
             "artist_name": self.artist_name,
             "plex_artist_key": self.plex_artist_key,
-            "thumb": self.thumb_url,
+            # Served through the app's proxy so the Plex token never reaches the browser
+            "thumb": f"/api/artists/{self.id}/thumb" if self.thumb_url else None,
             "track_title": self.track_title,
             "track_key": self.track_key,
             "stream_key": self.stream_key,
