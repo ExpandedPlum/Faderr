@@ -1,34 +1,35 @@
-"""Plex API interactions.
+"""Plex access through one long-lived client.
 
-Everything here is synchronous (plexapi uses `requests`); async callers must
-run these functions via `asyncio.to_thread` so they don't block the event loop.
+plexapi is synchronous (it uses `requests`). PlexClient runs every plexapi
+call in a worker thread *inside* its async methods, so callers simply await
+them and can't block the event loop by forgetting `asyncio.to_thread`. The
+PlexServer connection is created once and reused; if it drops, read-only
+calls reconnect and retry once.
 """
+import asyncio
+import logging
 import random
 import re
+import threading
 import unicodedata
-from typing import Optional
+from typing import Callable, Optional, TypeVar
 
+import httpx
+import requests
 from plexapi.audio import Track
 from plexapi.server import PlexServer
 
 from config import config
 
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
 # Plex rejects very long playlist URIs, so tracks are fetched and added in chunks.
 _CHUNK_SIZE = 200
 
 
-def _get_server() -> PlexServer:
-    return PlexServer(config.PLEX_URL, config.PLEX_TOKEN)
-
-
-def get_server() -> PlexServer:
-    """Return a new PlexServer instance for callers that need to reuse one connection."""
-    return _get_server()
-
-
-def _get_music_section(server: PlexServer):
-    return server.library.section(config.PLEX_MUSIC_LIBRARY)
-
+# ── Pure helpers ──────────────────────────────────────────────────────────────
 
 def normalize_name(name: str) -> str:
     name = unicodedata.normalize("NFKD", name)
@@ -39,21 +40,17 @@ def normalize_name(name: str) -> str:
     return name
 
 
-def get_all_artists(server: Optional[PlexServer] = None) -> list[dict]:
-    """Return every artist in the music library. `thumb` is a Plex path
-    (no host or token); the app serves it through its own thumbnail proxy."""
-    server = server or _get_server()
-    section = _get_music_section(server)
-    artists = section.all(libtype="artist")
-    return [
-        {
-            "name": a.title,
-            "rating_key": str(a.ratingKey),
-            "thumb": a.thumb or None,
-        }
-        for a in artists
-        if a.title
-    ]
+def _mbid(item) -> Optional[str]:
+    """The MusicBrainz ID Plex reports for an item (from its `mbid://` GUID), if any."""
+    try:
+        guids = item.guids or []
+    except Exception:
+        return None
+    for guid in guids:
+        gid = getattr(guid, "id", "") or ""
+        if gid.startswith("mbid://"):
+            return gid[len("mbid://"):] or None
+    return None
 
 
 def _track_part_key(track) -> Optional[str]:
@@ -82,25 +79,46 @@ def _track_files(tracks) -> list[str]:
     return files
 
 
+def _chunks(items: list, size: int = _CHUNK_SIZE):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+# ── Blocking operations (run in worker threads by PlexClient) ────────────────
+
 def _artist_tracks(server: PlexServer, artist_rating_key: str) -> list:
     """All tracks for an artist in a single request (no separate artist fetch)."""
     return server.fetchItems(f"/library/metadata/{int(artist_rating_key)}/allLeaves", cls=Track)
 
 
-def resolve_track_for_artist(
-    server: PlexServer,
-    artist_rating_key: str,
-    lastfm_title: Optional[str],
+def _all_artists(server: PlexServer) -> list[dict]:
+    section = server.library.section(config.PLEX_MUSIC_LIBRARY)
+    # includeGuids (plexapi's default) puts MusicBrainz IDs in this same listing
+    artists = section.all(libtype="artist", includeGuids=True)
+    return [
+        {
+            "name": a.title,
+            "rating_key": str(a.ratingKey),
+            "thumb": a.thumb or None,
+            "mbid": _mbid(a),
+        }
+        for a in artists
+        if a.title
+    ]
+
+
+def _resolve_track(
+    server: PlexServer, artist_rating_key: str, lastfm_title: Optional[str], keep_track_key: Optional[str],
 ) -> tuple[Optional[dict], str, list[str]]:
-    """Resolve the best track for an artist using an existing PlexServer connection.
-    Returns (track_dict, source, file_paths) where source is 'lastfm' or 'plex_random'
-    and file_paths are the on-disk paths of the artist's tracks (used to match Lidarr).
-    Makes only ONE Plex request per artist, regardless of source.
-    """
     tracks = _artist_tracks(server, artist_rating_key)
     if not tracks:
         return None, "plex_random", []
     files = _track_files(tracks)
+
+    if keep_track_key:
+        for track in tracks:
+            if str(track.ratingKey) == keep_track_key:
+                return _track_dict(track), "kept", files
 
     if lastfm_title:
         title_lower = lastfm_title.lower()
@@ -111,33 +129,12 @@ def resolve_track_for_artist(
     return _track_dict(random.choice(tracks)), "plex_random", files
 
 
-def get_artist_file_paths(artist_rating_key: str) -> list[str]:
-    """Return the on-disk file paths of every track by this artist."""
-    return _track_files(_artist_tracks(_get_server(), artist_rating_key))
-
-
-def get_additional_tracks(artist_rating_key: str, exclude_key: str, count: int = 5) -> list[dict]:
-    """Get up to `count` additional tracks from an artist, excluding a specific track."""
-    tracks = [t for t in _artist_tracks(_get_server(), artist_rating_key) if str(t.ratingKey) != exclude_key]
-    selected = random.sample(tracks, min(count, len(tracks)))
-    return [_track_dict(t) for t in selected]
-
-
-def get_all_tracks(artist_rating_key: str, exclude_key: Optional[str] = None) -> list[dict]:
-    """Return all tracks for an artist, optionally excluding one key, shuffled."""
-    tracks = [t for t in _artist_tracks(_get_server(), artist_rating_key) if str(t.ratingKey) != exclude_key]
+def _other_tracks(server: PlexServer, artist_rating_key: str, exclude_key: Optional[str], count: Optional[int]) -> list[dict]:
+    tracks = [t for t in _artist_tracks(server, artist_rating_key) if str(t.ratingKey) != exclude_key]
     random.shuffle(tracks)
+    if count is not None:
+        tracks = tracks[:count]
     return [_track_dict(t) for t in tracks]
-
-
-def get_track_stream_key(track_rating_key: str) -> Optional[str]:
-    """Return the part path for a single track."""
-    return _track_part_key(_get_server().fetchItem(int(track_rating_key)))
-
-
-def _chunks(items: list, size: int = _CHUNK_SIZE):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
 
 
 def _fetch_tracks(server: PlexServer, track_keys: list[str]) -> list:
@@ -145,23 +142,11 @@ def _fetch_tracks(server: PlexServer, track_keys: list[str]) -> list:
     return server.fetchItems("/library/metadata/" + ",".join(str(int(k)) for k in track_keys))
 
 
-def _find_playlist(server: PlexServer, name: str):
+def _replace_playlist(server: PlexServer, name: str, track_keys: list[str]) -> None:
     for pl in server.playlists():
         if pl.title == name:
-            return pl
-    return None
-
-
-def create_or_replace_playlist(name: str, track_keys: list[str], server: Optional[PlexServer] = None):
-    """Create the triage playlist, replacing it if it already exists.
-    Pass an existing `server` to reuse the connection (avoids an extra PlexServer() init)."""
-    if server is None:
-        server = _get_server()
-    existing = _find_playlist(server, name)
-    if existing is not None:
-        existing.delete()
-    if not track_keys:
-        return
+            pl.delete()
+            break
     playlist = None
     for chunk in _chunks(track_keys):
         items = _fetch_tracks(server, chunk)
@@ -173,45 +158,91 @@ def create_or_replace_playlist(name: str, track_keys: list[str], server: Optiona
             playlist.addItems(items)
 
 
-def append_tracks_to_playlist(name: str, track_keys: list[str]):
-    """Add tracks to an existing playlist."""
-    if not track_keys:
-        return
-    server = _get_server()
-    playlist = _find_playlist(server, name)
-    if playlist is None:
-        return
-    for chunk in _chunks(track_keys):
-        playlist.addItems(_fetch_tracks(server, chunk))
+def _delete_artist(server: PlexServer, artist_rating_key: str) -> None:
+    server.fetchItem(int(artist_rating_key)).delete()
 
 
-def remove_track_from_playlist(name: str, track_key: str):
-    """Remove a specific track from the playlist."""
-    server = _get_server()
-    playlist = _find_playlist(server, name)
-    if playlist is None:
-        return
-    for item in playlist.items():
-        if str(item.ratingKey) == track_key:
-            playlist.removeItems([item])
-            return
+# ── Client ────────────────────────────────────────────────────────────────────
+
+class PlexClient:
+    def __init__(self, url: str, token: str):
+        self._url = url
+        self._token = token
+        self._server: Optional[PlexServer] = None
+        self._server_lock = threading.Lock()
+        # Async HTTP client for streaming media through the app's proxy.
+        # Created in start(), because it belongs to the running event loop.
+        self.http: Optional[httpx.AsyncClient] = None
+
+    async def start(self) -> None:
+        self.http = httpx.AsyncClient(
+            base_url=self._url.rstrip("/"),
+            headers={"X-Plex-Token": self._token},
+            timeout=httpx.Timeout(15.0, read=60.0),
+        )
+
+    async def aclose(self) -> None:
+        if self.http is not None:
+            await self.http.aclose()
+            self.http = None
+
+    def _server_conn(self) -> PlexServer:
+        with self._server_lock:
+            if self._server is None:
+                self._server = PlexServer(self._url, self._token)
+            return self._server
+
+    def _drop_server(self, server: PlexServer) -> None:
+        with self._server_lock:
+            if self._server is server:
+                self._server = None
+
+    async def _call(self, fn: Callable[..., T], *args, retry: bool = True) -> T:
+        """Run a blocking plexapi function in a worker thread. Read-only calls
+        (retry=True) reconnect and try once more if the connection dropped;
+        calls that change things are never repeated automatically."""
+        def run():
+            server = self._server_conn()
+            try:
+                return fn(server, *args)
+            except requests.exceptions.ConnectionError:
+                self._drop_server(server)
+                if not retry:
+                    raise
+                logger.info("Plex connection dropped; reconnecting")
+                return fn(self._server_conn(), *args)
+        return await asyncio.to_thread(run)
+
+    async def all_artists(self) -> list[dict]:
+        """Every artist in the music library: name, rating_key, thumb (a Plex
+        path, no host or token) and mbid (MusicBrainz ID, if Plex has one)."""
+        return await self._call(_all_artists)
+
+    async def resolve_track(
+        self, artist_rating_key: str, lastfm_title: Optional[str], keep_track_key: Optional[str] = None,
+    ) -> tuple[Optional[dict], str, list[str]]:
+        """Pick the artist's triage track with ONE Plex request. Returns
+        (track, source, file_paths); source is "kept" (keep_track_key still
+        exists), "lastfm" or "plex_random". file_paths are used to match Lidarr."""
+        return await self._call(_resolve_track, artist_rating_key, lastfm_title, keep_track_key)
+
+    async def artist_file_paths(self, artist_rating_key: str) -> list[str]:
+        return await self._call(lambda s, k: _track_files(_artist_tracks(s, k)), artist_rating_key)
+
+    async def other_tracks(self, artist_rating_key: str, exclude_key: Optional[str], count: Optional[int] = None) -> list[dict]:
+        """The artist's tracks other than `exclude_key`, shuffled; at most `count`."""
+        return await self._call(_other_tracks, artist_rating_key, exclude_key, count)
+
+    async def track_stream_key(self, track_rating_key: str) -> Optional[str]:
+        return await self._call(lambda s, k: _track_part_key(s.fetchItem(int(k))), track_rating_key)
+
+    async def replace_playlist(self, name: str, track_keys: list[str]) -> None:
+        """Replace the playlist called `name` with exactly these tracks (none: just delete it)."""
+        await self._call(_replace_playlist, name, track_keys, retry=False)
+
+    async def delete_artist(self, artist_rating_key: str) -> None:
+        """Delete an artist and all their media from Plex (for artists Lidarr doesn't manage)."""
+        await self._call(_delete_artist, artist_rating_key, retry=False)
 
 
-def replace_track_in_playlist(name: str, old_track_key: str, new_track_key: str):
-    """Swap one track for another in the playlist (best-effort; order not guaranteed)."""
-    server = _get_server()
-    playlist = _find_playlist(server, name)
-    if playlist is None:
-        return
-    for item in playlist.items():
-        if str(item.ratingKey) == old_track_key:
-            playlist.removeItems([item])
-            break
-    playlist.addItems([server.fetchItem(int(new_track_key))])
-
-
-def delete_artist_from_plex(artist_rating_key: str):
-    """Delete an artist and all their media from Plex (fallback for non-Lidarr artists)."""
-    server = _get_server()
-    artist = server.fetchItem(int(artist_rating_key))
-    artist.delete()
+plex = PlexClient(config.PLEX_URL, config.PLEX_TOKEN)

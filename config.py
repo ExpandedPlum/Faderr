@@ -26,6 +26,8 @@ class Config:
     # Add deleted artists to Lidarr's import list exclusions so import lists
     # (Spotify, Last.fm, etc.) don't re-add and re-download them.
     LIDARR_ADD_IMPORT_EXCLUSION: bool = _env_bool("LIDARR_ADD_IMPORT_EXCLUSION", True)
+    # Deletes wait this long before running, and can be undone meanwhile. 0 = run immediately.
+    DELETE_GRACE_SECONDS: int = int(os.environ.get("DELETE_GRACE_SECONDS", "300") or 0)
     TRIAGE_PLAYLIST_NAME: str = os.environ.get("TRIAGE_PLAYLIST_NAME", "Artist Triage")
     DATABASE_URL: str = os.environ.get("DATABASE_URL", f"sqlite+aiosqlite:///{BASE_DIR / 'triage.db'}")
     # HTTP Basic auth for the web UI and API. Auth is enabled when a password is set.

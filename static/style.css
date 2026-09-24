@@ -253,8 +253,7 @@ header h1 {
   opacity: 0.75;
 }
 .dot-undecided  { background: var(--text-dim); }
-.dot-keep, .dot-explore_keep { background: var(--keep-text); }
-.dot-explore    { background: var(--listen-text); }
+.dot-keep       { background: var(--keep-text); }
 .dot-delete     { background: var(--delete-text); }
 
 .sidebar-item-name {
@@ -541,6 +540,7 @@ main {
   font-size: 0.875rem;
   color: var(--delete-text);
 }
+.deleted-note p { margin-bottom: 0.5rem; }
 
 /* ── Artist bio — flowing context text, labelled, line-length controlled ── */
 
@@ -690,9 +690,9 @@ kbd {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
-.decision-keep, .decision-explore_keep { background: var(--badge-keep); color: var(--keep-text); }
-.decision-explore { background: var(--badge-listen); color: var(--listen-text); }
+.decision-keep    { background: var(--badge-keep); color: var(--keep-text); }
 .decision-delete  { background: var(--badge-delete); color: var(--delete-text); }
+.decision-failed  { outline: 1px solid var(--delete-text); cursor: help; }
 
 .history-undo {
   background: none;

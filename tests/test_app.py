@@ -1,4 +1,5 @@
 import base64
+import json
 
 import httpx
 import pytest
@@ -6,8 +7,9 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from config import config
-from services import plex_service
-from tests.conftest import add_artists, all_artists
+from services import generation_service
+from services.plex_service import plex
+from tests.conftest import add_artists, all_artists, track
 
 CSRF = {"X-Faderr-Request": "1"}
 
@@ -31,13 +33,13 @@ def plex_requests(client):
             })
         return httpx.Response(200, stream=httpx.ByteStream(b"data"), headers={"content-type": "image/jpeg"})
 
-    original = client.app.state.plex_http
-    client.app.state.plex_http = httpx.AsyncClient(
+    original = plex.http
+    plex.http = httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url=config.PLEX_URL,
         headers={"X-Plex-Token": config.PLEX_TOKEN},
     )
     yield seen
-    client.app.state.plex_http = original
+    plex.http = original
 
 
 # ── Auth / CSRF ──────────────────────────────────────────────────────────────
@@ -105,68 +107,46 @@ def test_unexpected_paths_are_not_proxied(client, plex_requests):
 
 # ── Decisions ────────────────────────────────────────────────────────────────
 
-def test_keep_is_saved_when_plex_playlist_update_fails(client, monkeypatch):
-    def boom(*args, **kwargs):
-        raise RuntimeError("Plex is down")
-    monkeypatch.setattr(plex_service, "remove_track_from_playlist", boom)
+def test_keep_and_undo(client):
     (artist_id,) = add_artists({"artist_name": "A", "track_key": "10"})
     resp = client.post(f"/api/artists/{artist_id}/decide", json={"decision": "keep"}, headers=CSRF)
-    assert resp.status_code == 200
-    assert all_artists()[0]["decision"] == "keep"
+    assert resp.status_code == 200 and resp.json()["decision"] == "keep"
+    assert client.post(f"/api/artists/{artist_id}/undo", headers=CSRF).json()["decision"] is None
 
 
-def test_undo_delete_is_refused(client):
-    (artist_id,) = add_artists({"artist_name": "A", "decision": "delete"})
-    resp = client.post(f"/api/artists/{artist_id}/undo", headers=CSRF)
-    assert resp.status_code == 409
-    assert all_artists()[0]["decision"] == "delete"
+def test_old_decision_values_are_rejected(client):
+    (artist_id,) = add_artists({"artist_name": "A"})
+    for decision in ("explore", "explore_keep", "explore_delete"):
+        resp = client.post(f"/api/artists/{artist_id}/decide", json={"decision": decision}, headers=CSRF)
+        assert resp.status_code == 400
 
 
-def test_refused_delete_returns_409_and_is_not_recorded(client, monkeypatch):
-    from services import lidarr_service
-    monkeypatch.setattr(plex_service, "get_artist_file_paths", lambda key: ["/m/A/x.flac"])
-    def unreachable():
-        raise RuntimeError("connection refused")
-    monkeypatch.setattr(lidarr_service, "get_all_artists", unreachable)
+def test_delete_is_queued_and_can_be_undone(client):
     (artist_id,) = add_artists({"artist_name": "A", "track_key": "10"})
     resp = client.post(f"/api/artists/{artist_id}/decide", json={"decision": "delete"}, headers=CSRF)
-    assert resp.status_code == 409
-    assert "Nothing was deleted" in resp.json()["detail"]
+    assert resp.status_code == 200
+    job = resp.json()["deletion"]
+    assert job["status"] == "pending" and job["cancellable"]
+    assert client.get(f"/api/artists/{artist_id}").json()["deletion"]["id"] == job["id"]
+    assert [j["id"] for j in client.get("/api/deletions").json()] == [job["id"]]
+    assert client.post(f"/api/artists/{artist_id}/decide", json={"decision": "keep"}, headers=CSRF).status_code == 409
+
+    undone = client.post(f"/api/artists/{artist_id}/undo", headers=CSRF).json()
+    assert undone["decision"] is None and undone["deletion"]["status"] == "cancelled"
+
+
+def test_cancel_and_retry_endpoints(client):
+    (artist_id,) = add_artists({"artist_name": "A", "track_key": "10"})
+    job = client.post(f"/api/artists/{artist_id}/decide", json={"decision": "delete"}, headers=CSRF).json()["deletion"]
+    assert client.post(f"/api/deletions/{job['id']}/retry", headers=CSRF).status_code == 409  # not failed
+    assert client.post(f"/api/deletions/{job['id']}/cancel", headers=CSRF).json()["status"] == "cancelled"
     assert all_artists()[0]["decision"] is None
+    assert client.post(f"/api/deletions/{job['id']}/cancel", headers=CSRF).status_code == 409
 
 
-def test_keep_filter_includes_explore_keep(client):
-    add_artists(
-        {"artist_name": "A", "decision": "keep"},
-        {"artist_name": "B", "decision": "explore_keep"},
-        {"artist_name": "C", "decision": "delete"},
-        {"artist_name": "D"},
-    )
-    names = [a["artist_name"] for a in client.get("/api/artists", params={"status": "keep"}).json()]
-    assert names == ["A", "B"]
-
-
-def test_stats(client):
-    add_artists(
-        {"artist_name": "A", "decision": "keep"},
-        {"artist_name": "B", "decision": "explore_keep"},
-        {"artist_name": "C", "decision": "delete"},
-        {"artist_name": "D"},
-    )
-    assert client.get("/api/stats").json() == {
-        "total": 4, "triaged": 3, "remaining": 1,
-        "keep": 1, "explore": 0, "explore_keep": 1, "deleted": 1,
-    }
-
-
-# ── Deleted artists and concurrent decisions ─────────────────────────────────
-
-@pytest.mark.parametrize("decision", ["keep", "explore", "explore_keep", "delete"])
-def test_no_decision_on_deleted_artist(client, monkeypatch, decision):
-    monkeypatch.setattr(plex_service, "remove_track_from_playlist", lambda *a: None)
-    (artist_id,) = add_artists({"artist_name": "Gone", "decision": "delete", "track_key": "1"})
-    resp = client.post(f"/api/artists/{artist_id}/decide", json={"decision": decision}, headers=CSRF)
-    assert resp.status_code == 409
+def test_legacy_delete_without_job_cannot_be_undone(client):
+    (artist_id,) = add_artists({"artist_name": "A", "decision": "delete"})
+    assert client.post(f"/api/artists/{artist_id}/undo", headers=CSRF).status_code == 409
     assert all_artists()[0]["decision"] == "delete"
 
 
@@ -175,25 +155,52 @@ def test_no_skip_on_deleted_artist(client):
     assert client.post(f"/api/artists/{artist_id}/skip", headers=CSRF).status_code == 409
 
 
-def test_keep_during_slow_delete_waits_and_is_refused(monkeypatch):
-    import asyncio
-    from services import triage_service
+def test_filters_and_stats(client):
+    add_artists(
+        {"artist_name": "A", "decision": "keep"},
+        {"artist_name": "C", "decision": "delete"},
+        {"artist_name": "D"},
+    )
+    names = lambda status: [a["artist_name"] for a in client.get("/api/artists", params={"status": status}).json()]
+    assert (names("keep"), names("delete"), names("undecided")) == (["A"], ["C"], ["D"])
+    assert client.get("/api/stats").json() == {
+        "total": 3, "triaged": 2, "remaining": 1, "keep": 1, "deleted": 1,
+        "delete_pending": 0, "delete_failed": 0,
+    }
 
-    async def slow_delete(artist):
-        await asyncio.sleep(0.2)
-    monkeypatch.setattr(triage_service, "_delete_artist", slow_delete)
-    monkeypatch.setattr(plex_service, "remove_track_from_playlist", lambda *a: None)
-    (artist_id,) = add_artists({"artist_name": "A", "track_key": "1"})
 
-    async def both():
-        return await asyncio.gather(
-            triage_service.make_decision(artist_id, "delete"),
-            triage_service.make_decision(artist_id, "keep"),
-        )
-    deleted, kept = asyncio.run(both())
-    assert deleted["decision"] == "delete"
-    assert kept["status_code"] == 409
-    assert all_artists()[0]["decision"] == "delete"
+# ── Generation stream and playlist ────────────────────────────────────────────
+
+def test_generation_streams_progress_from_the_database(client, monkeypatch):
+    async def fake_generate(on_progress):
+        await on_progress({"stage": "plex_fetch"})
+        await on_progress({"stage": "lastfm", "done": 1, "total": 1})
+        return {"total_artists": 1, "added": 1, "removed": 0, "playlist_name": "Artist Triage"}
+    monkeypatch.setattr(generation_service, "generate", fake_generate)
+
+    with client.stream("POST", "/api/generate/stream", headers=CSRF) as resp:
+        events = [json.loads(line[6:]) for line in resp.iter_lines() if line.startswith("data: ")]
+    assert events[-1]["stage"] == "done" and events[-1]["added"] == 1
+    assert client.get("/api/generate/status").json() == {"running": False}
+
+
+def test_playlist_sync_endpoint(client, fake_plex):
+    add_artists({"artist_name": "A", "track_key": "11"}, {"artist_name": "B", "track_key": "21", "decision": "keep"})
+    assert client.post("/api/playlist/sync", headers=CSRF).json() == {"playlist_name": "Artist Triage", "tracks": 1}
+    assert fake_plex.playlists == [("Artist Triage", ["11"])]
+
+
+def test_playlist_sync_failure_is_reported(client, fake_plex):
+    fake_plex.playlist_error = RuntimeError("Plex is down")
+    assert client.post("/api/playlist/sync", headers=CSRF).status_code == 502
+
+
+def test_skip_pins_new_track(client, fake_plex):
+    (artist_id,) = add_artists({"artist_name": "A", "plex_artist_key": "1", "track_key": "11"})
+    fake_plex.tracks["1"] = [track("11"), track("12")]
+    resp = client.post(f"/api/artists/{artist_id}/skip", headers=CSRF).json()
+    assert resp["track_key"] == "12"
+    assert all_artists()[0]["track_pinned"]
 
 
 # ── Paths don't depend on the working directory ──────────────────────────────

@@ -20,8 +20,9 @@ from starlette.background import BackgroundTask
 
 from config import config
 from models import init_db
-from services import triage_service
-from services.generation_runner import runner as generation_runner
+from services import deletion_service, triage_service
+from services.generation_service import runner as generation_runner
+from services.plex_service import plex
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -51,15 +52,14 @@ async def lifespan(app: FastAPI):
             "FADERR_PASSWORD is not set: anyone who can reach this server can delete artists. "
             "Set FADERR_PASSWORD in .env to require a login."
         )
-    app.state.plex_http = httpx.AsyncClient(
-        base_url=config.PLEX_URL.rstrip("/"),
-        headers={"X-Plex-Token": config.PLEX_TOKEN},
-        timeout=httpx.Timeout(15.0, read=None),
-    )
+    await plex.start()
+    deletion_service.worker.start()
     try:
         yield
     finally:
-        await app.state.plex_http.aclose()
+        await deletion_service.worker.stop()
+        await generation_runner.stop()
+        await plex.aclose()
 
 
 # Resolved from this file, not the working directory, so the app also starts
@@ -101,8 +101,10 @@ async def security(request: Request, call_next):
 
 
 def _raise_for_result(result: dict) -> dict:
-    if "error" in result:
-        raise HTTPException(status_code=result.get("status_code", 404), detail=result["error"])
+    """Service functions report failures as {"error": message, "status_code": code}.
+    (Only that shape: a deletion record also has an "error" field, holding its failure reason.)"""
+    if "status_code" in result and "error" in result:
+        raise HTTPException(status_code=result["status_code"], detail=result["error"])
     return result
 
 
@@ -117,32 +119,46 @@ async def index(request: Request):
 
 @app.get("/api/generate/status")
 async def generate_status():
-    return {"running": generation_runner.running}
+    return {"running": (await generation_runner.status())["running"]}
 
 
 @app.post("/api/generate/stream")
 async def generate_stream():
-    """Start playlist generation (or join the run in progress) and stream its
-    progress as Server-Sent Events. Generation runs in the background, so a
-    client disconnecting doesn't cancel it."""
-    queue = generation_runner.subscribe()
-    generation_runner.start()
+    """Start playlist generation (or join the run in progress, in any server
+    process) and stream its progress as Server-Sent Events. Progress is read
+    from the database, and a client disconnecting doesn't cancel the run."""
+    await generation_runner.start()
 
     async def event_stream():
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
+        last_sent = None
+        idle = 0.0
+        while True:
+            state = await generation_runner.status()
+            event = state["progress"] if state["running"] else (state["result"] or state["progress"])
+            if event is not None and event != last_sent:
                 yield f"data: {json.dumps(event)}\n\n"
-                if event.get("stage") in ("done", "error"):
-                    break
-        finally:
-            generation_runner.unsubscribe(queue)
+                last_sent, idle = event, 0.0
+            if not state["running"]:
+                break
+            await asyncio.sleep(0.3)
+            idle += 0.3
+            if idle >= 15:
+                yield ": keepalive\n\n"
+                idle = 0.0
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ── Plex playlist ─────────────────────────────────────────────────────────────
+
+@app.post("/api/playlist/sync")
+async def sync_playlist():
+    """Rebuild the Plex playlist from the current queue."""
+    try:
+        return await triage_service.sync_playlist()
+    except Exception as exc:
+        logger.exception("Playlist sync failed")
+        raise HTTPException(status_code=502, detail=f"Couldn't update the Plex playlist: {exc}")
 
 
 # ── Artist reads ──────────────────────────────────────────────────────────────
@@ -181,22 +197,20 @@ async def get_artist(artist_id: int):
 @app.get("/api/artists/{artist_id}/bio")
 async def get_bio(artist_id: int):
     from services import lastfm_service as lfm
-    artist = await triage_service.get_artist_by_id(artist_id)
+    artist = await triage_service.get_artist_row(artist_id)
     if not artist:
         raise HTTPException(status_code=404, detail="Artist not found")
-    bio = await lfm.get_artist_bio(artist["artist_name"])
-    return {"bio": bio}
+    return {"bio": await lfm.get_artist_bio(artist.artist_name)}
 
 
 @app.get("/api/artists/{artist_id}/tracks")
 async def get_artist_tracks(artist_id: int):
     """Return all tracks for an artist (shuffled), excluding the triage track."""
-    from services import plex_service as ps
-    artist = await triage_service.get_artist_by_id(artist_id)
+    artist = await triage_service.get_artist_row(artist_id)
     if not artist:
         raise HTTPException(status_code=404, detail="Artist not found")
     try:
-        return await asyncio.to_thread(ps.get_all_tracks, artist["plex_artist_key"], artist["track_key"])
+        return await plex.other_tracks(artist.plex_artist_key, artist.track_key)
     except Exception as exc:
         logger.exception("Failed to get tracks for artist_id=%s", artist_id)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -208,7 +222,7 @@ async def get_artist_tracks(artist_id: int):
 # the server, and the browser only needs to reach Faderr, not Plex.
 
 async def _proxy_plex(request: Request, path: str) -> StreamingResponse:
-    client: httpx.AsyncClient = request.app.state.plex_http
+    client: httpx.AsyncClient = plex.http
     headers = {}
     if "range" in request.headers:
         headers["Range"] = request.headers["range"]
@@ -247,9 +261,8 @@ async def stream(artist_id: int, request: Request):
 @app.get("/api/tracks/{rating_key}/stream")
 async def stream_track(rating_key: int, request: Request):
     """Stream any library track by its Plex rating key (used by the play queue)."""
-    from services import plex_service as ps
     try:
-        key = await asyncio.to_thread(ps.get_track_stream_key, str(rating_key))
+        key = await plex.track_stream_key(str(rating_key))
     except Exception as exc:
         logger.warning("Track lookup failed for rating_key=%s: %s", rating_key, exc)
         raise HTTPException(status_code=404, detail="Track not found")
@@ -271,47 +284,36 @@ async def artist_thumb(artist_id: int, request: Request):
 
 # ── Decisions ─────────────────────────────────────────────────────────────────
 
+async def _handled(description: str, coro) -> dict:
+    """Await a service call, turning its error dicts and exceptions into HTTP errors."""
+    try:
+        return _raise_for_result(await coro)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("%s failed", description)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 class DecisionBody(BaseModel):
     decision: str
 
 
 @app.post("/api/artists/{artist_id}/decide")
 async def decide(artist_id: int, body: DecisionBody):
-    valid = {"keep", "explore", "delete", "explore_keep", "explore_delete"}
-    if body.decision not in valid:
-        raise HTTPException(status_code=400, detail=f"decision must be one of {valid}")
-    try:
-        return _raise_for_result(await triage_service.make_decision(artist_id, body.decision))
-    except HTTPException:
-        raise
-    except triage_service.DeletionError as exc:
-        logger.warning("Deletion refused for artist_id=%s: %s", artist_id, exc)
-        raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
-        logger.exception("Decision failed for artist_id=%s", artist_id)
-        raise HTTPException(status_code=500, detail=str(exc))
+    if body.decision not in triage_service.DECISION_CHOICES:
+        raise HTTPException(status_code=400, detail=f"decision must be one of {triage_service.DECISION_CHOICES}")
+    return await _handled(f"Decision for artist_id={artist_id}", triage_service.make_decision(artist_id, body.decision))
 
 
 @app.post("/api/artists/{artist_id}/undo")
 async def undo(artist_id: int):
-    try:
-        return _raise_for_result(await triage_service.undo_decision(artist_id))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Undo failed for artist_id=%s", artist_id)
-        raise HTTPException(status_code=500, detail=str(exc))
+    return await _handled(f"Undo for artist_id={artist_id}", triage_service.undo_decision(artist_id))
 
 
 @app.post("/api/artists/{artist_id}/skip")
 async def skip(artist_id: int):
-    try:
-        return _raise_for_result(await triage_service.skip_track(artist_id))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Skip failed for artist_id=%s", artist_id)
-        raise HTTPException(status_code=500, detail=str(exc))
+    return await _handled(f"Skip for artist_id={artist_id}", triage_service.skip_track(artist_id))
 
 
 class NotesBody(BaseModel):
@@ -320,10 +322,24 @@ class NotesBody(BaseModel):
 
 @app.patch("/api/artists/{artist_id}/notes")
 async def notes(artist_id: int, body: NotesBody):
-    try:
-        return _raise_for_result(await triage_service.update_notes(artist_id, body.notes))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Notes update failed for artist_id=%s", artist_id)
-        raise HTTPException(status_code=500, detail=str(exc))
+    return await _handled(f"Notes update for artist_id={artist_id}", triage_service.update_notes(artist_id, body.notes))
+
+
+# ── Deletions (queue and audit log) ───────────────────────────────────────────
+
+@app.get("/api/deletions")
+async def deletions():
+    return await deletion_service.list_jobs()
+
+
+@app.post("/api/deletions/{job_id}/cancel")
+async def cancel_deletion(job_id: int):
+    return await _handled(f"Cancel deletion {job_id}", triage_service.cancel_deletion(job_id))
+
+
+@app.post("/api/deletions/{job_id}/retry")
+async def retry_deletion(job_id: int):
+    job = await deletion_service.retry(job_id)
+    if job is None:
+        raise HTTPException(status_code=409, detail="Only a failed delete can be retried.")
+    return job.to_dict()

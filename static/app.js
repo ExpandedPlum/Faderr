@@ -260,6 +260,7 @@ async function focusArtist(id, autoplay = true) {
 
   const artistChanged = !focusedArtist || focusedArtist.id !== data.id;
   focusedArtist = data;
+  if (data.decision === "delete") loadStats();  // its delete may have finished or failed since
 
   sectionEmpty.classList.add("hidden");
   sectionDone.classList.add("hidden");
@@ -324,11 +325,47 @@ async function loadStats() {
   const pct = s.total > 0 ? Math.round((s.triaged / s.total) * 100) : 0;
   $("stats-label").textContent = `${s.triaged} / ${s.total} artists triaged`;
   $("progress-bar").style.width = pct + "%";
-  $("stats-breakdown").textContent =
-    `Keep: ${s.keep + s.explore_keep}  ·  Exploring: ${s.explore}  ·  Deleted: ${s.deleted}`;
+  let breakdown = `Keep: ${s.keep}  ·  Deleted: ${s.deleted}`;
+  if (s.delete_pending) breakdown += `  ·  ${s.delete_pending} waiting to delete`;
+  if (s.delete_failed) breakdown += `  ·  ${s.delete_failed} failed to delete`;
+  $("stats-breakdown").textContent = breakdown;
 }
 
-// (Exploring queue removed — "Listen to More" now plays tracks in-player without making a decision)
+// ── Deletion status ────────────────────────────────────────────────────────
+// Deletes are queued jobs: "pending" during the grace period (undoable),
+// then "running", then "done" or "failed" (retry or undo).
+
+function fmtClock(iso) {
+  return iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+}
+
+function deletionLabel(job) {
+  if (!job || job.status === "done") return "Deleted";
+  if (job.status === "pending") return `Deleting at ${fmtClock(job.run_after)}`;
+  if (job.status === "running") return "Deleting…";
+  if (job.status === "failed") return "Delete failed";
+  return "Deleted";
+}
+
+function deletionSentence(job) {
+  if (!job || job.status === "done") return "This artist has been deleted. Its files are gone, so no other decision can be made.";
+  if (job.status === "pending") return `Scheduled for deletion at ${fmtClock(job.run_after)}. You can undo it until then.`;
+  if (job.status === "running") return "Deleting now…";
+  if (job.status === "failed") return `The delete failed and nothing more will happen until you retry or undo it. ${job.error || ""}`;
+  return "This artist has been deleted.";
+}
+
+async function undoArtist(artistId) {
+  await api(`/api/artists/${artistId}/undo`, { method: "POST" });
+}
+
+async function retryDeletion(jobId) {
+  await api(`/api/deletions/${jobId}/retry`, { method: "POST" });
+}
+
+function errorModal(e) {
+  showModal("Error", e.message, [{label:"OK", primary:true, action:()=>{}}]);
+}
 
 // ── History ────────────────────────────────────────────────────────────────
 
@@ -349,22 +386,33 @@ async function loadHistory() {
   artists.forEach(a => {
     const li = document.createElement("li");
     li.className = "history-item";
-    const decLabel = { keep:"Keep", explore:"Exploring", explore_keep:"Kept", delete:"Deleted" }[a.decision] || a.decision;
+    const job = a.deletion;
+    const isDelete = a.decision === "delete";
+    const label = isDelete ? deletionLabel(job) : "Keep";
+    const canUndo = !isDelete || (job && job.cancellable);
+    const canRetry = isDelete && job && job.status === "failed";
+    const title = isDelete && job && job.error ? ` title="${esc(job.error)}"` : "";
     li.innerHTML = `
       <span>${esc(a.artist_name)}</span>
       <div style="display:flex;align-items:center;gap:0.4rem">
-        <span class="history-decision decision-${a.decision}">${esc(decLabel)}</span>
-        ${a.decision !== "delete" ? `<button class="history-undo" data-id="${a.id}">Undo</button>` : ""}
+        <span class="history-decision decision-${esc(a.decision)}${canRetry ? " decision-failed" : ""}"${title}>${esc(label)}</span>
+        ${canRetry ? `<button class="history-undo history-retry" data-job="${job.id}">Retry</button>` : ""}
+        ${canUndo ? `<button class="history-undo history-undo-btn" data-id="${a.id}">Undo</button>` : ""}
       </div>`;
     list.appendChild(li);
   });
-  list.querySelectorAll(".history-undo").forEach(btn => {
+  list.querySelectorAll(".history-undo-btn").forEach(btn => {
     btn.addEventListener("click", async () => {
       btn.disabled = true;
-      try {
-        await api(`/api/artists/${btn.dataset.id}/undo`, { method: "POST" });
-        await refresh(); await loadHistory();
-      } catch(e) { showModal("Error", e.message, [{label:"OK", primary:true, action:()=>{}}]); btn.disabled = false; }
+      try { await undoArtist(btn.dataset.id); await refresh(); await loadHistory(); }
+      catch(e) { errorModal(e); btn.disabled = false; }
+    });
+  });
+  list.querySelectorAll(".history-retry").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try { await retryDeletion(btn.dataset.job); await loadHistory(); await loadStats(); }
+      catch(e) { errorModal(e); btn.disabled = false; }
     });
   });
 }
@@ -403,8 +451,72 @@ function updateActionButtons() {
   ["btn-keep", "btn-explore", "btn-delete", "btn-skip", "btn-delete-confirm"].forEach(id => { $(id).disabled = blocked; });
   const deleted = !!focusedArtist && focusedArtist.decision === "delete";
   $("deleted-note").classList.toggle("hidden", !deleted);
-  if (deleted) deleteConfirm.classList.add("hidden");
+  if (deleted) {
+    deleteConfirm.classList.add("hidden");
+    const job = focusedArtist.deletion;
+    $("deleted-note-text").textContent = deletionSentence(job);
+    $("btn-undo-delete").classList.toggle("hidden", !(job && job.cancellable));
+    $("btn-retry-delete").classList.toggle("hidden", !(job && job.status === "failed"));
+  }
+  scheduleDeletionPoll();
 }
+
+// While the focused artist's delete is waiting or running, check on it
+let deletionPollTimer = null;
+function scheduleDeletionPoll() {
+  clearTimeout(deletionPollTimer);
+  const job = focusedArtist && focusedArtist.decision === "delete" ? focusedArtist.deletion : null;
+  if (!job || !["pending", "running"].includes(job.status)) return;
+  const id = focusedArtist.id;
+  deletionPollTimer = setTimeout(async () => {
+    if (!focusedArtist || focusedArtist.id !== id) return;
+    try {
+      const data = await api(`/api/artists/${id}`);
+      if (focusedArtist && focusedArtist.id === id) {
+        focusedArtist = data;
+        updateActionButtons();
+        if (!["pending", "running"].includes((data.deletion || {}).status)) { loadStats(); loadSidebar(); }
+      }
+    } catch(e) { scheduleDeletionPoll(); }
+  }, 5000);
+}
+
+$("btn-undo-delete").addEventListener("click", async () => {
+  if (!focusedArtist) return;
+  const id = focusedArtist.id;
+  $("btn-undo-delete").disabled = true;
+  try {
+    await undoArtist(id);
+    focusedArtist = await api(`/api/artists/${id}`);
+    updateActionButtons();
+    await Promise.all([loadStats(), loadSidebar()]);
+  } catch(e) { errorModal(e); }
+  finally { $("btn-undo-delete").disabled = false; }
+});
+
+$("btn-retry-delete").addEventListener("click", async () => {
+  if (!focusedArtist || !focusedArtist.deletion) return;
+  const id = focusedArtist.id;
+  $("btn-retry-delete").disabled = true;
+  try {
+    await retryDeletion(focusedArtist.deletion.id);
+    focusedArtist = await api(`/api/artists/${id}`);
+    updateActionButtons();
+    await loadStats();
+  } catch(e) { errorModal(e); }
+  finally { $("btn-retry-delete").disabled = false; }
+});
+
+$("btn-sync-playlist").addEventListener("click", async () => {
+  const btn = $("btn-sync-playlist");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/playlist/sync", { method: "POST" });
+    showModal("Plex playlist updated", `"${r.playlist_name}" now has ${r.tracks} tracks: one per undecided artist.`,
+      [{ label: "OK", primary: true, action: () => {} }]);
+  } catch(e) { errorModal(e); }
+  finally { btn.disabled = false; }
+});
 
 async function decide(decision) {
   if (!actionsAllowed()) return;
@@ -580,19 +692,21 @@ async function startGenerationStream() {
           const pct = total ? 60 + Math.round((evt.done / total) * 30) : 80;
           genProgressLabel.textContent = `Resolving tracks: ${evt.done} / ${total}`;
           genProgressBar.style.width = pct + "%";
+        } else if (evt.stage === "saving") {
+          genProgressLabel.textContent = "Saving the queue…";
+          genProgressBar.style.width = "92%";
         } else if (evt.stage === "playlist_create") {
           genProgressLabel.textContent = "Creating Plex playlist…";
           genProgressBar.style.width = "95%";
         } else if (evt.stage === "done") {
           finished = true;
           genProgressBar.style.width = "100%";
-          genProgressLabel.textContent = `Done! ${evt.total_artists} artists added.`;
+          genProgressLabel.textContent = `Done! ${evt.total_artists} artists to triage.`;
           setTimeout(() => {
             genProgressWrap.style.display = "none";
           }, 3000);
-          let message = evt.playlist_warning
-            ? `${evt.total_artists} artists are ready to triage. ${evt.playlist_warning}`
-            : `"${evt.playlist_name}" created with ${evt.total_artists} artists.`;
+          let message = `${evt.total_artists} artists are waiting to be triaged (${evt.added} new, ${evt.removed} removed from Plex).`;
+          message += evt.playlist_warning ? ` ${evt.playlist_warning}` : ` The Plex playlist "${evt.playlist_name}" was rebuilt.`;
           const failed = evt.failed_artists || [];
           if (failed.length) {
             const shown = failed.slice(0, 5).join(", ") + (failed.length > 5 ? `, and ${failed.length - 5} more` : "");
