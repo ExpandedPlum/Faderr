@@ -92,3 +92,27 @@ def test_runner_survives_subscriber_leaving(monkeypatch):
         assert not runner.running
 
     asyncio.run(scenario())
+
+
+def test_one_failing_artist_is_skipped_not_fatal(fake_sources, monkeypatch):
+    def resolve(server, key, lastfm_title):
+        if key == "2":
+            raise RuntimeError("Plex 500 for this artist")
+        return ({"title": "t", "rating_key": f"10{key}", "stream_key": None}, "plex_random", ["/m/x/a.flac"])
+    monkeypatch.setattr(plex_service, "resolve_track_for_artist", resolve)
+    result = asyncio.run(triage_service.generate_triage_playlist())
+    assert result["total_artists"] == 2
+    assert result["failed_artists"] == ["B"]
+    assert [a["artist_name"] for a in all_artists()] == ["A", "C"]
+
+
+def test_same_name_artists_are_tracked_separately(fake_sources, monkeypatch):
+    from tests.conftest import add_artists
+    add_artists({"artist_name": "Nirvana", "plex_artist_key": "1", "decision": "keep"})
+    monkeypatch.setattr(plex_service, "get_all_artists", lambda server=None: [
+        {"name": "Nirvana", "rating_key": "1", "thumb": None},
+        {"name": "Nirvana", "rating_key": "2", "thumb": None},
+    ])
+    asyncio.run(triage_service.generate_triage_playlist())
+    rows = sorted((a["plex_artist_key"], a["decision"]) for a in all_artists())
+    assert rows == [("1", "keep"), ("2", None)]

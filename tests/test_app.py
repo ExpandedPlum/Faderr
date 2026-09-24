@@ -157,3 +157,49 @@ def test_stats(client):
         "total": 4, "triaged": 3, "remaining": 1,
         "keep": 1, "explore": 0, "explore_keep": 1, "deleted": 1,
     }
+
+
+# ── Deleted artists and concurrent decisions ─────────────────────────────────
+
+@pytest.mark.parametrize("decision", ["keep", "explore", "explore_keep", "delete"])
+def test_no_decision_on_deleted_artist(client, monkeypatch, decision):
+    monkeypatch.setattr(plex_service, "remove_track_from_playlist", lambda *a: None)
+    (artist_id,) = add_artists({"artist_name": "Gone", "decision": "delete", "track_key": "1"})
+    resp = client.post(f"/api/artists/{artist_id}/decide", json={"decision": decision}, headers=CSRF)
+    assert resp.status_code == 409
+    assert all_artists()[0]["decision"] == "delete"
+
+
+def test_no_skip_on_deleted_artist(client):
+    (artist_id,) = add_artists({"artist_name": "Gone", "decision": "delete", "track_key": "1"})
+    assert client.post(f"/api/artists/{artist_id}/skip", headers=CSRF).status_code == 409
+
+
+def test_keep_during_slow_delete_waits_and_is_refused(monkeypatch):
+    import asyncio
+    from services import triage_service
+
+    async def slow_delete(artist):
+        await asyncio.sleep(0.2)
+    monkeypatch.setattr(triage_service, "_delete_artist", slow_delete)
+    monkeypatch.setattr(plex_service, "remove_track_from_playlist", lambda *a: None)
+    (artist_id,) = add_artists({"artist_name": "A", "track_key": "1"})
+
+    async def both():
+        return await asyncio.gather(
+            triage_service.make_decision(artist_id, "delete"),
+            triage_service.make_decision(artist_id, "keep"),
+        )
+    deleted, kept = asyncio.run(both())
+    assert deleted["decision"] == "delete"
+    assert kept["status_code"] == 409
+    assert all_artists()[0]["decision"] == "delete"
+
+
+# ── Paths don't depend on the working directory ──────────────────────────────
+
+def test_serves_ui_from_another_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with TestClient(app_module.app) as c:
+        assert c.get("/").status_code == 200
+        assert c.get("/static/app.js").status_code == 200

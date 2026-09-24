@@ -1,7 +1,12 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+
+# .env and the default database live next to the app, whatever the working directory
+load_dotenv(BASE_DIR / ".env")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -22,7 +27,7 @@ class Config:
     # (Spotify, Last.fm, etc.) don't re-add and re-download them.
     LIDARR_ADD_IMPORT_EXCLUSION: bool = _env_bool("LIDARR_ADD_IMPORT_EXCLUSION", True)
     TRIAGE_PLAYLIST_NAME: str = os.environ.get("TRIAGE_PLAYLIST_NAME", "Artist Triage")
-    DATABASE_URL: str = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///triage.db")
+    DATABASE_URL: str = os.environ.get("DATABASE_URL", f"sqlite+aiosqlite:///{BASE_DIR / 'triage.db'}")
     # HTTP Basic auth for the web UI and API. Auth is enabled when a password is set.
     FADERR_USERNAME: str = os.environ.get("FADERR_USERNAME", "faderr")
     FADERR_PASSWORD: str = os.environ.get("FADERR_PASSWORD", "")

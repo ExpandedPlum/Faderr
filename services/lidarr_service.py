@@ -11,6 +11,7 @@ from services.plex_service import normalize_name
 logger = logging.getLogger(__name__)
 
 _HEADERS = {"X-Api-Key": config.LIDARR_API_KEY}
+_DELETE_TIMEOUT = 120
 
 
 def _url(path: str) -> str:
@@ -104,7 +105,8 @@ def delete_artist(lidarr_id: int, delete_files: bool = True):
     Empty folders left behind can be cleaned up via Lidarr → System → Tasks → Clean Up Recycle Bin
     or the 'Clean Empty Folders' task."""
     add_exclusion = config.LIDARR_ADD_IMPORT_EXCLUSION
-    with httpx.Client(headers=_HEADERS, timeout=30) as client:
+    # Deleting a large artist on network storage can take a while
+    with httpx.Client(headers=_HEADERS, timeout=httpx.Timeout(15, read=_DELETE_TIMEOUT)) as client:
         resp = client.delete(
             _url(f"/api/v1/artist/{lidarr_id}"),
             params={
@@ -117,6 +119,16 @@ def delete_artist(lidarr_id: int, delete_files: bool = True):
             "Deleted Lidarr artist id=%s (deleteFiles=%s, addImportListExclusion=%s)",
             lidarr_id, delete_files, add_exclusion,
         )
+
+
+def artist_exists(lidarr_id: int) -> bool:
+    """True if Lidarr still has this artist, False if it's gone (404)."""
+    with httpx.Client(headers=_HEADERS, timeout=15) as client:
+        resp = client.get(_url(f"/api/v1/artist/{lidarr_id}"))
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
 
 
 def unmonitor_artist(lidarr_id: int):

@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -61,9 +62,13 @@ async def lifespan(app: FastAPI):
         await app.state.plex_http.aclose()
 
 
+# Resolved from this file, not the working directory, so the app also starts
+# from a service manager that runs it elsewhere.
+BASE_DIR = Path(__file__).resolve().parent
+
 app = FastAPI(title="Faderr", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 
 # ── Security ──────────────────────────────────────────────────────────────────

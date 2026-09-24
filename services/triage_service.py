@@ -16,8 +16,32 @@ logger = logging.getLogger(__name__)
 _PLEX_CONCURRENCY = 4
 
 
+# Lidarr error message when a delete times out; the delete may still finish.
+_LIDARR_TIMEOUT_HINT = (
+    "Lidarr didn't respond in time and may still be deleting {name!r}. "
+    "Check Lidarr, then refresh Faderr and try again if the artist is still there."
+)
+
+
 class DeletionError(Exception):
-    """Raised when an artist can't be deleted safely. Nothing has been deleted."""
+    """Raised when Faderr won't delete an artist because it can't be done
+    safely. Faderr has deleted nothing; the message says what to check."""
+
+
+# One decision at a time per artist. Without this, pressing Keep while a slow
+# delete is still running would let whichever request commits last win, and
+# the record could say "keep" for an artist whose files are gone.
+_artist_locks: dict[int, asyncio.Lock] = {}
+
+
+def _artist_lock(artist_id: int) -> asyncio.Lock:
+    lock = _artist_locks.get(artist_id)
+    if lock is None:
+        lock = _artist_locks[artist_id] = asyncio.Lock()
+    return lock
+
+
+_ALREADY_DELETED = {"error": "This artist has already been deleted.", "status_code": 409}
 
 
 async def _noop_progress(evt: dict) -> None:
@@ -87,23 +111,32 @@ async def generate_triage_playlist(
     # 4. Resolve a track for each undecided artist. Plex calls are blocking, so
     # they run in worker threads; that keeps the server responsive and lets
     # progress events stream out while this runs.
-    decided_names = await _decided_artist_names()
-    logger.info("Skipping %d already-decided artists during regeneration", len(decided_names))
+    # Decided artists are identified by their Plex key, not their name: two
+    # different artists can share a name, and deciding one must not hide the other.
+    decided_keys = await _decided_artist_keys()
+    logger.info("Skipping %d already-decided artists during regeneration", len(decided_keys))
 
     semaphore = asyncio.Semaphore(_PLEX_CONCURRENCY)
     resolved_count = 0
+    failed: list[str] = []
 
     async def resolve(artist: dict) -> Optional[TriageArtist]:
         nonlocal resolved_count
         name = artist["name"]
         try:
-            if name in decided_names:
+            if artist["rating_key"] in decided_keys:
                 return None  # already decided — preserve existing row, don't create a duplicate
             async with semaphore:
-                track, source, file_paths = await asyncio.to_thread(
-                    plex_service.resolve_track_for_artist,
-                    plex_server, artist["rating_key"], lastfm_results.get(name),
-                )
+                try:
+                    track, source, file_paths = await asyncio.to_thread(
+                        plex_service.resolve_track_for_artist,
+                        plex_server, artist["rating_key"], lastfm_results.get(name),
+                    )
+                except Exception as exc:
+                    # One broken artist shouldn't sink the whole run
+                    logger.warning("Couldn't load tracks for %r, skipping: %s", name, exc)
+                    failed.append(name)
+                    return None
             if not track:
                 logger.warning("No tracks found for artist %r, skipping", name)
                 return None
@@ -131,11 +164,8 @@ async def generate_triage_playlist(
     await on_progress({"stage": "playlist_create"})
     async with async_session() as session:
         async with session.begin():
-            result = await session.execute(
-                select(TriageArtist.artist_name).where(TriageArtist.decision.is_not(None))
-            )
-            decided_now = {row[0] for row in result.fetchall()}
-            rows = [r for r in rows if r.artist_name not in decided_now]
+            decided_now = await _decided_artist_keys(session)
+            rows = [r for r in rows if r.plex_artist_key not in decided_now]
             await session.execute(
                 delete(TriageArtist).where(TriageArtist.decision.is_(None))
             )
@@ -158,18 +188,23 @@ async def generate_triage_playlist(
         playlist_warning = f"The Plex playlist couldn't be created: {exc}"
 
     result = {"total_artists": len(rows), "playlist_name": config.TRIAGE_PLAYLIST_NAME}
+    if failed:
+        result["failed_artists"] = failed
     if playlist_warning:
         result["playlist_warning"] = playlist_warning
     await on_progress({"stage": "done", **result})
     return result
 
 
-async def _decided_artist_names() -> set[str]:
-    async with async_session() as session:
-        result = await session.execute(
-            select(TriageArtist.artist_name).where(TriageArtist.decision.is_not(None))
-        )
-        return {row[0] for row in result.fetchall()}
+async def _decided_artist_keys(session=None) -> set[str]:
+    """Plex artist keys of every artist that already has a decision."""
+    query = select(TriageArtist.plex_artist_key).where(TriageArtist.decision.is_not(None))
+    if session is not None:
+        result = await session.execute(query)
+    else:
+        async with async_session() as own_session:
+            result = await own_session.execute(query)
+    return {row[0] for row in result.fetchall()}
 
 
 async def get_all_artists_for_list(status: Optional[str] = None, search: Optional[str] = None) -> list[dict]:
@@ -217,6 +252,11 @@ async def update_notes(artist_id: int, notes: str) -> dict:
 
 async def skip_track(artist_id: int) -> dict:
     """Pick a different random track for this artist and update DB + Plex playlist."""
+    async with _artist_lock(artist_id):
+        return await _skip_track(artist_id)
+
+
+async def _skip_track(artist_id: int) -> dict:
     async with async_session() as session:
         result = await session.execute(
             select(TriageArtist).where(TriageArtist.id == artist_id)
@@ -224,6 +264,8 @@ async def skip_track(artist_id: int) -> dict:
         artist = result.scalars().first()
         if not artist:
             return {"error": "Artist not found"}
+        if artist.decision == "delete":
+            return _ALREADY_DELETED
 
         old_track_key = artist.track_key
         alternatives = await asyncio.to_thread(
@@ -298,6 +340,11 @@ async def make_decision(artist_id: int, decision: str) -> dict:
     best-effort, so an unreachable Plex server can't block a keep. Deletion is
     the exception: the artist must actually be deleted before it is recorded.
     """
+    async with _artist_lock(artist_id):
+        return await _make_decision(artist_id, decision)
+
+
+async def _make_decision(artist_id: int, decision: str) -> dict:
     playlist_ops: list[tuple[str, Callable, tuple]] = []
 
     async with async_session() as session:
@@ -307,6 +354,9 @@ async def make_decision(artist_id: int, decision: str) -> dict:
         artist = result.scalars().first()
         if not artist:
             return {"error": "Artist not found"}
+        if artist.decision == "delete":
+            # The files are gone; any other decision would leave a wrong record
+            return _ALREADY_DELETED
 
         now = datetime.now(timezone.utc)
         remove_track = (
@@ -357,6 +407,11 @@ def _append_explore_tracks(plex_artist_key: str, track_key: str):
 
 async def undo_decision(artist_id: int) -> dict:
     """Revert a decision back to undecided and re-add the track to the playlist."""
+    async with _artist_lock(artist_id):
+        return await _undo_decision(artist_id)
+
+
+async def _undo_decision(artist_id: int) -> dict:
     async with async_session() as session:
         result = await session.execute(
             select(TriageArtist).where(TriageArtist.id == artist_id)
@@ -423,6 +478,21 @@ async def _delete_artist(artist: TriageArtist):
             logger.info("Deleted artist %r via Lidarr (id=%s)", name, match.lidarr_id)
             return
         except Exception as exc:
+            # A failed request doesn't always mean a failed delete (e.g. a
+            # timeout while Lidarr kept working), so ask Lidarr before acting.
+            try:
+                still_there = await asyncio.to_thread(lidarr_service.artist_exists, match.lidarr_id)
+            except Exception as check_exc:
+                raise DeletionError(
+                    f"Lidarr delete failed for {name!r} ({exc}) and Lidarr couldn't be asked "
+                    f"whether it went through ({check_exc}). Check Lidarr before trying again."
+                ) from check_exc
+            if not still_there:
+                logger.info("Lidarr delete for %r reported %s, but the artist is gone — treating as deleted", name, exc)
+                return
+            if isinstance(exc, httpx.TimeoutException):
+                # Lidarr may still be deleting; deleting through Plex now would race it
+                raise DeletionError(_LIDARR_TIMEOUT_HINT.format(name=name)) from exc
             logger.error("Lidarr delete failed for %r: %s — attempting unmonitor", name, exc)
             try:
                 await asyncio.to_thread(lidarr_service.unmonitor_artist, match.lidarr_id)

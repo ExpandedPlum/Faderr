@@ -536,6 +536,12 @@ main {
 }
 .confirm-buttons { display: flex; gap: 0.5rem; }
 
+.deleted-note {
+  margin-bottom: 0.75rem;
+  font-size: 0.875rem;
+  color: var(--delete-text);
+}
+
 /* ── Artist bio — flowing context text, labelled, line-length controlled ── */
 
 .artist-bio-wrap {

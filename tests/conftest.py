@@ -8,7 +8,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.chdir(ROOT)  # app.py mounts "static" and "templates" by relative path
 
 _DB_DIR = tempfile.mkdtemp(prefix="faderr-tests-")
 os.environ.update({

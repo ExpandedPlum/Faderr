@@ -1,5 +1,6 @@
 import asyncio
 
+import httpx
 import pytest
 
 from models import TriageArtist
@@ -22,6 +23,8 @@ def env(monkeypatch):
         "lidarr_error": None,
         "delete_error": None,
         "unmonitor_error": None,
+        "exists": True,          # what Lidarr says after a failed delete
+        "exists_error": None,
     }
 
     def get_all_artists():
@@ -34,6 +37,11 @@ def env(monkeypatch):
             raise state["delete_error"]
         calls.lidarr_deleted.append(lidarr_id)
 
+    def artist_exists(lidarr_id):
+        if state["exists_error"]:
+            raise state["exists_error"]
+        return state["exists"]
+
     def unmonitor(lidarr_id):
         if state["unmonitor_error"]:
             raise state["unmonitor_error"]
@@ -44,6 +52,7 @@ def env(monkeypatch):
     monkeypatch.setattr(lidarr_service, "get_all_artists", get_all_artists)
     monkeypatch.setattr(lidarr_service, "delete_artist", delete_artist)
     monkeypatch.setattr(lidarr_service, "unmonitor_artist", unmonitor)
+    monkeypatch.setattr(lidarr_service, "artist_exists", artist_exists)
     return calls, state
 
 
@@ -106,3 +115,37 @@ def test_lidarr_delete_and_unmonitor_fail_deletes_nothing(env):
     with pytest.raises(triage_service.DeletionError):
         run_delete()
     assert calls.plex_deleted == []
+
+
+def test_failed_request_but_artist_gone_counts_as_deleted(env):
+    calls, state = env
+    state["delete_error"] = RuntimeError("502 from reverse proxy")
+    state["exists"] = False
+    run_delete()
+    assert calls.unmonitored == [] and calls.plex_deleted == []
+
+
+def test_timeout_while_lidarr_still_deleting_does_not_race_it(env):
+    calls, state = env
+    state["delete_error"] = httpx.ReadTimeout("timed out")
+    state["exists"] = True
+    with pytest.raises(triage_service.DeletionError, match="may still be deleting"):
+        run_delete()
+    assert calls.unmonitored == [] and calls.plex_deleted == []
+
+
+def test_timeout_then_artist_gone_counts_as_deleted(env):
+    calls, state = env
+    state["delete_error"] = httpx.ReadTimeout("timed out")
+    state["exists"] = False
+    run_delete()
+    assert calls.plex_deleted == []
+
+
+def test_cannot_confirm_after_failure_deletes_nothing_more(env):
+    calls, state = env
+    state["delete_error"] = RuntimeError("500")
+    state["exists_error"] = RuntimeError("connection refused")
+    with pytest.raises(triage_service.DeletionError):
+        run_delete()
+    assert calls.unmonitored == [] and calls.plex_deleted == []

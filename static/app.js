@@ -278,6 +278,8 @@ async function focusArtist(id, autoplay = true) {
   if (data.thumb) { artistThumb.src = data.thumb; artistThumb.style.display = ""; }
   else { artistThumb.src = ""; artistThumb.style.display = "none"; }
 
+  updateActionButtons();
+
   if (artistChanged && data.stream_key) {
     loadAudio(data.id, autoplay);
   } else if (!data.stream_key) {
@@ -379,6 +381,7 @@ async function refresh() {
     sectionDone.classList.remove("hidden");
     resetAudio();
     focusedArtist = null;
+    updateActionButtons();
     updateSidebarActive();
   } else if (!focusedArtist || focusedArtist.id !== next.id) {
     await focusArtist(next.id);
@@ -387,13 +390,34 @@ async function refresh() {
 
 // ── Decision helpers ───────────────────────────────────────────────────────
 
+// Only one decision at a time: a second click or key press while a (possibly
+// slow) delete is running must not send a competing decision.
+let decisionInFlight = false;
+
+function actionsAllowed() {
+  return !!focusedArtist && !decisionInFlight && focusedArtist.decision !== "delete";
+}
+
+function updateActionButtons() {
+  const blocked = !actionsAllowed();
+  ["btn-keep", "btn-explore", "btn-delete", "btn-skip", "btn-delete-confirm"].forEach(id => { $(id).disabled = blocked; });
+  const deleted = !!focusedArtist && focusedArtist.decision === "delete";
+  $("deleted-note").classList.toggle("hidden", !deleted);
+  if (deleted) deleteConfirm.classList.add("hidden");
+}
+
 async function decide(decision) {
-  if (!focusedArtist) return;
+  if (!actionsAllowed()) return;
+  decisionInFlight = true;
+  updateActionButtons();
   try {
     await api(`/api/artists/${focusedArtist.id}/decide`, { method: "POST", body: JSON.stringify({ decision }) });
     await refresh();
   } catch(e) {
     showModal("Error", e.message, [{label:"OK", primary:true, action:()=>{}}]);
+  } finally {
+    decisionInFlight = false;
+    updateActionButtons();
   }
 }
 
@@ -413,7 +437,7 @@ $("btn-generate").addEventListener("click", () => {
 $("btn-keep").addEventListener("click", () => decide("keep"));
 
 $("btn-explore").addEventListener("click", async () => {
-  if (!focusedArtist) return;
+  if (!actionsAllowed()) return;
   $("btn-explore").disabled = true;
   audioStatus.textContent = "Loading tracks…";
   try {
@@ -426,25 +450,23 @@ $("btn-explore").addEventListener("click", async () => {
     audioStatus.textContent = "Couldn't load tracks";
     console.error(e);
   } finally {
-    $("btn-explore").disabled = false;
+    updateActionButtons();
   }
 });
 
 $("btn-delete").addEventListener("click", () => {
-  if (!focusedArtist) return;
+  if (!actionsAllowed()) return;
   deleteArtistName.textContent = focusedArtist.artist_name;
   deleteConfirm.classList.remove("hidden");
 });
 $("btn-delete-cancel").addEventListener("click", () => deleteConfirm.classList.add("hidden"));
 $("btn-delete-confirm").addEventListener("click", async () => {
-  $("btn-delete-confirm").disabled = true;
   await decide("delete");
-  $("btn-delete-confirm").disabled = false;
   deleteConfirm.classList.add("hidden");
 });
 
 $("btn-skip").addEventListener("click", async () => {
-  if (!focusedArtist) return;
+  if (!actionsAllowed()) return;
   $("btn-skip").disabled = true;
   try {
     const updated = await api(`/api/artists/${focusedArtist.id}/skip`, { method: "POST" });
@@ -455,7 +477,7 @@ $("btn-skip").addEventListener("click", async () => {
   } catch(e) {
     showModal("Skip failed", e.message, [{label:"OK", primary:true, action:()=>{}}]);
   } finally {
-    $("btn-skip").disabled = false;
+    updateActionButtons();
   }
 });
 
@@ -568,9 +590,14 @@ async function startGenerationStream() {
           setTimeout(() => {
             genProgressWrap.style.display = "none";
           }, 3000);
-          const message = evt.playlist_warning
+          let message = evt.playlist_warning
             ? `${evt.total_artists} artists are ready to triage. ${evt.playlist_warning}`
             : `"${evt.playlist_name}" created with ${evt.total_artists} artists.`;
+          const failed = evt.failed_artists || [];
+          if (failed.length) {
+            const shown = failed.slice(0, 5).join(", ") + (failed.length > 5 ? `, and ${failed.length - 5} more` : "");
+            message += ` ${failed.length} artist(s) were skipped because Plex couldn't load their tracks: ${shown}. See the server log for details.`;
+          }
           showModal("Playlist Ready", message, [
             { label: "OK", primary: true, action: () => {} },
           ]);
@@ -618,13 +645,13 @@ window.addEventListener("keydown", e => {
 
   switch (e.key) {
     case "k": case "K":
-      if (focusedArtist) decide("keep");
+      decide("keep");
       break;
     case "e": case "E":
-      if (focusedArtist) $("btn-explore").click();
+      if (actionsAllowed()) $("btn-explore").click();
       break;
     case "d": case "D":
-      if (focusedArtist) {
+      if (actionsAllowed()) {
         deleteArtistName.textContent = focusedArtist.artist_name;
         deleteConfirm.classList.remove("hidden");
       }

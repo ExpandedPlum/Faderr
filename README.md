@@ -57,6 +57,8 @@ Faderr only deletes when it can tell exactly which files belong to the artist:
 - If Lidarr is unreachable, or the match is ambiguous (for example, a Lidarr artist has the same name but a different folder), **nothing is deleted** and you get an explanation instead.
 - Files are only deleted through Plex when Lidarr definitely doesn't manage the artist, or after Lidarr has been told to stop monitoring it, so Lidarr won't download them again.
 - By default, deleted artists are added to Lidarr's import list exclusions so import lists don't re-add them (`LIDARR_ADD_IMPORT_EXCLUSION`).
+- If a Lidarr delete times out, Faderr asks Lidarr whether the artist is gone before doing anything else, and never deletes through Plex while Lidarr might still be working.
+- A deleted artist can't be given any other decision, and only one decision per artist runs at a time.
 
 Before using the delete action at scale:
 - Confirm your Lidarr recycle bin or backup is configured if you want a safety net
@@ -121,14 +123,14 @@ Optional settings: `FADERR_USERNAME`, `LIDARR_ADD_IMPORT_EXCLUSION` (default `tr
 venv/bin/uvicorn app:app --host 0.0.0.0 --port 8811
 ```
 
-For persistent home server deployment, run under `systemd` or your container's process supervisor.
+For persistent home server deployment, run under `systemd` or your container's process supervisor. Faderr finds its files, `.env` and the default `triage.db` next to `app.py`, so it doesn't matter which directory it's started from.
 
 ---
 
 ## Operational notes
 
 - **First run:** Generation can take a few minutes on large libraries due to Last.fm rate limiting. Progress streams live in the header. Generation runs on the server, so closing the tab doesn't stop it; reopening the page picks the progress back up, and a second Generate click joins the run already in progress.
-- **Regenerating:** Refreshes all undecided artists. Already-decided artists are not affected.
+- **Regenerating:** Refreshes all undecided artists. Already-decided artists are not affected. Artists are tracked by their Plex ID, so two different artists with the same name are triaged separately. If Plex fails to load one artist's tracks, that artist is skipped (and listed when generation finishes) rather than failing the whole run.
 - **Deletion flow:** Faderr calls Lidarr's delete endpoint. Lidarr handles file removal on the media server. Empty folders can be cleaned via Lidarr → System → Scheduled Tasks → "Clean Up Recycle Bin", or by enabling **Settings → Media Management → Delete Empty Folders**.
 - **Artists not in Lidarr:** If an artist's files aren't in any Lidarr artist folder, deletion goes through the Plex API instead (Plex's "Allow media deletion" setting must be on).
 
