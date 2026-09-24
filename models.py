@@ -174,5 +174,15 @@ class GenerationState(Base):
     result = Column(Text)  # JSON of the final "done" or "error" event
 
 
+class Setting(Base):
+    """A setting saved from the web UI (connection details, secrets). Values
+    from the environment take priority; see services/settings_service.py."""
+    __tablename__ = "settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(Text)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 async def init_db():
     await migrations.migrate(engine)

@@ -180,6 +180,7 @@ async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { "Content-Type": "application/json", ...CSRF_HEADERS, ...(opts.headers || {}) } });
   if (!res.ok) {
     const text = await res.text();
+    if (res.status === 503 && text.includes("setup_required")) window.location = "/settings";
     throw new Error(`${res.status}: ${text}`);
   }
   return res.json();

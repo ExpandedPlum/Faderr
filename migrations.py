@@ -182,10 +182,23 @@ def _m3_jobs(conn: Connection) -> None:
     conn.exec_driver_sql("INSERT INTO generation_state (id) VALUES (1)")
 
 
+# ── 4: settings configured in the web UI ──
+
+def _m4_settings(conn: Connection) -> None:
+    conn.exec_driver_sql("""
+        CREATE TABLE settings (
+            key VARCHAR NOT NULL PRIMARY KEY,
+            value TEXT,
+            updated_at DATETIME DEFAULT (CURRENT_TIMESTAMP)
+        )
+    """)
+
+
 MIGRATIONS: list[Callable[[Connection], None]] = [
     _m1_initial,
     _m2_one_row_per_artist,
     _m3_jobs,
+    _m4_settings,
 ]
 LATEST = len(MIGRATIONS)
 

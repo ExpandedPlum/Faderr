@@ -119,16 +119,27 @@ def resolve_artist(
 
 # ── API client ────────────────────────────────────────────────────────────────
 
+class NotConfiguredError(RuntimeError):
+    """Raised when Lidarr hasn't been set up yet (see the Settings page)."""
+
+
 class LidarrClient:
     """Async Lidarr API client. Lidarr is called rarely (once per generation,
     a few times per delete), so each call uses a short-lived connection; that
-    also keeps the client independent of any particular event loop."""
+    also keeps the client independent of any particular event loop.
+    Connection details come from the settings store via configure()."""
 
-    def __init__(self, url: str, api_key: str):
-        self._base = url.rstrip("/")
-        self._headers = {"X-Api-Key": api_key}
+    def __init__(self):
+        self._base: Optional[str] = None
+        self._headers: dict = {}
+
+    def configure(self, url: Optional[str], api_key: Optional[str]) -> None:
+        self._base = url.rstrip("/") if url and api_key else None
+        self._headers = {"X-Api-Key": api_key} if api_key else {}
 
     def _client(self, read_timeout: float = 15) -> httpx.AsyncClient:
+        if not self._base:
+            raise NotConfiguredError("Lidarr isn't set up yet. Open Settings to connect it.")
         return httpx.AsyncClient(
             base_url=self._base, headers=self._headers, timeout=httpx.Timeout(15, read=read_timeout),
         )
@@ -181,4 +192,4 @@ class LidarrClient:
         logger.info("Unmonitored Lidarr artist id=%s", lidarr_id)
 
 
-lidarr = LidarrClient(config.LIDARR_URL, config.LIDARR_API_KEY)
+lidarr = LidarrClient()

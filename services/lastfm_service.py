@@ -5,7 +5,7 @@ from typing import Optional
 
 import httpx
 
-from config import config
+from services.settings_service import store
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +22,18 @@ _RETRYABLE_ERRORS = {8, 11, 16, 29}
 
 async def _call(client: httpx.AsyncClient, params: dict, artist_name: str) -> Optional[dict]:
     """Call a Last.fm API method, retrying temporary failures with backoff.
-    Returns the parsed response, or None if there is no usable result."""
+    Returns the parsed response, or None if there is no usable result. Last.fm
+    is optional: without an API key there are no lookups (random tracks, no bios)."""
+    api_key = store.current.get("lastfm_api_key")
+    if not api_key:
+        return None
     for attempt in range(_ATTEMPTS):
         last_attempt = attempt == _ATTEMPTS - 1
         wait = 2 ** attempt
         try:
             resp = await client.get(
                 LASTFM_BASE,
-                params={**params, "api_key": config.LASTFM_API_KEY, "format": "json"},
+                params={**params, "api_key": api_key, "format": "json"},
                 timeout=10.0,
             )
         except httpx.HTTPError as exc:

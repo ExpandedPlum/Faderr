@@ -31,6 +31,7 @@ import models  # noqa: E402
 from services import lastfm_service  # noqa: E402
 from services.lidarr_service import lidarr  # noqa: E402
 from services.plex_service import plex  # noqa: E402
+from services.settings_service import store as settings_store  # noqa: E402
 
 # No connection pooling in tests: each test (and TestClient) runs its own event
 # loop, and pooled aiosqlite connections can't move between loops.
@@ -49,9 +50,20 @@ async def _reset_db():
     await models.init_db()
 
 
+async def _reload_settings():
+    settings_store._applied = None
+    await settings_store.load()
+
+
+def reload_settings():
+    """Re-read settings now (e.g. after changing environment variables)."""
+    asyncio.run(_reload_settings())
+
+
 @pytest.fixture(autouse=True)
 def fresh_db():
     asyncio.run(_reset_db())
+    reload_settings()
     yield
 
 
