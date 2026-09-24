@@ -3,6 +3,7 @@ password, and secrets never leaving the server."""
 import asyncio
 import base64
 import json
+import secrets
 
 import httpx
 import pytest
@@ -212,33 +213,43 @@ def test_saved_settings_configure_the_clients(unconfigured, client, web):
 
 # ── Password ──────────────────────────────────────────────────────────────────
 
+def throwaway_password() -> str:
+    """A password made up for one test. Generated rather than written in the
+    code, so the repo holds nothing that looks like a credential."""
+    return secrets.token_urlsafe(12)
+
+
 def basic(user, password):
     return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
 
 
 def test_password_set_in_ui_protects_everything(unconfigured, client):
-    assert client.post("/api/settings/password", json={"password": "short"}, headers=CSRF).status_code == 400
-    assert client.post("/api/settings/password", json={"password": "correct horse"}, headers=CSRF).status_code == 200
+    password, other = throwaway_password(), throwaway_password()
+    too_short = password[:7]
+    assert client.post("/api/settings/password", json={"password": too_short}, headers=CSRF).status_code == 400
+    assert client.post("/api/settings/password", json={"password": password}, headers=CSRF).status_code == 200
     assert client.get("/api/settings").status_code == 401
-    assert client.get("/api/settings", headers=basic("faderr", "wrong")).status_code == 401
-    assert client.get("/api/settings", headers=basic("faderr", "correct horse")).status_code == 200
-    assert "correct horse" not in (store.current.password_hash or "")
+    assert client.get("/api/settings", headers=basic("faderr", other)).status_code == 401
+    assert client.get("/api/settings", headers=basic("faderr", password)).status_code == 200
+    assert password not in (store.current.password_hash or "")
 
 
 def test_env_password_overrides_and_cannot_be_changed(client, monkeypatch):
-    monkeypatch.setenv("FADERR_PASSWORD", "from-env-123")
+    env_password = throwaway_password()
+    monkeypatch.setenv("FADERR_PASSWORD", env_password)
     reload_settings()
-    auth = basic("faderr", "from-env-123")
-    resp = client.post("/api/settings/password", json={"password": "something-else"}, headers={**CSRF, **auth})
+    auth = basic("faderr", env_password)
+    resp = client.post("/api/settings/password", json={"password": throwaway_password()}, headers={**CSRF, **auth})
     assert resp.status_code == 409
 
 
 def test_password_hashing():
-    stored = hash_password("hunter22")
-    assert stored.startswith("scrypt$") and "hunter22" not in stored
-    assert verify_password("hunter22", stored)
-    assert not verify_password("hunter23", stored)
-    assert not verify_password("hunter22", "garbage")
+    password = throwaway_password()
+    stored = hash_password(password)
+    assert stored.startswith("scrypt$") and password not in stored
+    assert verify_password(password, stored)
+    assert not verify_password(password + "x", stored)
+    assert not verify_password(password, "not-a-hash")
 
 
 # ── Choosing a connection ─────────────────────────────────────────────────────

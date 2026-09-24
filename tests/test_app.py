@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import secrets
 
 import httpx
 import pytest
@@ -47,12 +48,13 @@ def plex_requests(client):
 # ── Auth / CSRF ──────────────────────────────────────────────────────────────
 
 def test_auth_required_when_password_set(client, monkeypatch):
-    monkeypatch.setenv("FADERR_PASSWORD", "hunter2")
+    password = secrets.token_urlsafe(12)  # generated, so the repo holds no credential-like strings
+    monkeypatch.setenv("FADERR_PASSWORD", password)
     reload_settings()
     assert client.get("/api/stats").status_code == 401
-    bad = base64.b64encode(b"faderr:wrong").decode()
+    bad = base64.b64encode(f"faderr:{password}x".encode()).decode()
     assert client.get("/api/stats", headers={"Authorization": f"Basic {bad}"}).status_code == 401
-    good = base64.b64encode(b"faderr:hunter2").decode()
+    good = base64.b64encode(f"faderr:{password}".encode()).decode()
     assert client.get("/api/stats", headers={"Authorization": f"Basic {good}"}).status_code == 200
 
 
