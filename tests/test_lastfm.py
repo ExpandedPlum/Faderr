@@ -1,8 +1,10 @@
 import asyncio
+import logging
 
 import httpx
 import pytest
 
+import app  # noqa: F401  (sets up logging)
 from services import lastfm_service
 
 
@@ -58,3 +60,9 @@ def test_server_errors_retried_then_give_up():
 
 def test_empty_toptracks():
     assert run_top_track([ok([])]) == (None, 1)
+
+
+def test_api_key_is_not_logged(caplog):
+    with caplog.at_level(logging.DEBUG):
+        run_top_track([ok([{"name": "Hit"}])])
+    assert "lastfm-key" not in caplog.text
