@@ -28,6 +28,9 @@ from services.settings_service import store as settings
 from settings_api import router as settings_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+# httpx logs every request URL at INFO, and Last.fm takes its API key as a
+# query parameter, so those lines would write the key to the journal.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Header the frontend sends on every state-changing request. A cross-site page
